@@ -19,7 +19,7 @@ GPU-accelerated AprilTag tracking pipeline for ant behavioral studies.
 `pyproject.toml` is the single source of truth. Inside any Python ≥ 3.10 env:
 
 ```bash
-git clone https://github.com/ychemtob/yoto.git
+git clone https://github.com/Social-Evolution-and-Behavior/yoto.git
 cd yoto
 pip install -e ".[dev,fast]"     # add ,docs,lint if needed
 pre-commit install
