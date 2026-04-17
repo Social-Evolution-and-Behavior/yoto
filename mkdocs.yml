@@ -1,0 +1,73 @@
+site_name: YOTO
+site_description: GPU-accelerated AprilTag tracking pipeline for ant behavioral studies
+site_url: https://ychemtob.github.io/yoto
+repo_url: https://github.com/ychemtob/yoto
+repo_name: ychemtob/yoto
+
+theme:
+  name: material
+  palette:
+    - scheme: default
+      primary: deep orange
+      accent: amber
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: slate
+      primary: deep orange
+      accent: amber
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.expand
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+  icon:
+    repo: fontawesome/brands/github
+
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          options:
+            docstring_style: numpy
+            show_source: true
+            show_root_heading: true
+  - git-revision-date-localized:
+      enable_creation_date: true
+
+nav:
+  - Home: index.md
+  - Installation: guides/installation.md
+  - Quickstart: guides/quickstart.md
+  - User Guide:
+      - Detection Pipeline: guides/detection.md
+      - Data Cleaning: guides/cleaning.md
+      - Video Overlay: guides/video.md
+  - API Reference:
+      - Detection: api/detection.md
+      - Cleaning: api/cleaning.md
+      - Video: api/video.md
+      - Image Processing: api/image_processing.md
+      - Constants: api/constants.md
+
+markdown_extensions:
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - admonition
+  - pymdownx.details
+  - toc:
+      permalink: true
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/ychemtob/yoto

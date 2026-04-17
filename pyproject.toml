@@ -1,0 +1,111 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "yoto"
+dynamic = ["version"]
+description = "GPU-accelerated AprilTag tracking pipeline for ant behavioral studies"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [
+    { name = "Yohann Chemtob" },
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Image Recognition",
+]
+dependencies = [
+    "numpy>=1.24",
+    "opencv-python>=4.8",
+    "pandas>=2.0",
+    "Pillow>=10.0",
+    "tqdm>=4.60",
+    "ultralytics>=8.0",
+]
+
+[project.optional-dependencies]
+fast = [
+    "torch>=2.0",
+    "pynvvideocodec>=2.0",
+]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "pytest-mock>=3.10",
+    "hypothesis>=6.80",
+]
+docs = [
+    "mkdocs-material>=9.0",
+    "mkdocstrings[python]>=0.20",
+    "mkdocs-git-revision-date-localized-plugin>=1.0",
+]
+lint = [
+    "black>=23.0",
+    "flake8>=6.0",
+    "mypy>=1.5",
+    "vulture>=2.7",
+]
+
+[project.scripts]
+yoto = "yoto.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/ychemtob/yoto"
+Documentation = "https://ychemtob.github.io/yoto"
+Repository = "https://github.com/ychemtob/yoto"
+Issues = "https://github.com/ychemtob/yoto/issues"
+
+[tool.hatch.version]
+path = "src/yoto/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/yoto"]
+
+# ---------------------------------------------------------------------------
+# Black
+# ---------------------------------------------------------------------------
+[tool.black]
+line-length = 88
+target-version = ["py310"]
+
+# ---------------------------------------------------------------------------
+# MyPy
+# ---------------------------------------------------------------------------
+[tool.mypy]
+check_untyped_defs = true
+no_implicit_optional = true
+
+[[tool.mypy.overrides]]
+module = [
+    "apriltag.*",
+    "ultralytics.*",
+    "PyNvVideoCodec.*",
+    "cv2.*",
+]
+ignore_missing_imports = true
+
+# ---------------------------------------------------------------------------
+# Pytest
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["--strict-markers"]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "integration: marks integration tests",
+]
+
+# ---------------------------------------------------------------------------
+# Vulture
+# ---------------------------------------------------------------------------
+[tool.vulture]
+min_confidence = 80
+paths = ["src/yoto"]
