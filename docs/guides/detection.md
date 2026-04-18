@@ -21,7 +21,11 @@ df = run_detection_simple(
 ## Fast Pipeline
 
 The high-throughput variant uses NVDEC hardware decoding and GPU-resident
-pre-processing. It requires `PyNvVideoCodec` and an NVIDIA GPU with NVDEC.
+pre-processing. It requires `PyNvVideoCodec`, `tensorrt`,
+`onnxruntime-gpu`, and an NVIDIA GPU with NVDEC.
+
+Weights can be `.pt`, `.engine` / `.trt`, or `.onnx` — the loader picks
+the right backend automatically based on the file extension.
 
 ```python
 from yoto import run_detection_fast
@@ -34,6 +38,38 @@ df = run_detection_fast(
     debug=True,  # prints per-stage profiling
 )
 ```
+
+### TensorRT engine export
+
+For `.engine` / `.trt` weights the fast pipeline loads the engine directly
+via the `tensorrt` Python API (bypassing Ultralytics' `AutoBackend`, which
+corrupts TRT binding addresses when called outside its `predict` loop and
+crashes NVDEC via CUDA-context poisoning).
+
+Export with `dynamic=True` so the engine accepts variable batch sizes:
+
+```bash
+yolo export model=detect14.pt format=engine imgsz=1024 \
+    half=True batch=20 dynamic=True
+```
+
+Without `dynamic=True` the engine has a fixed batch size and will crash
+when fed a smaller trailing batch. `.pt` weights still go through the
+normal YOLO path.
+
+### ONNX export
+
+For `.onnx` weights the fast pipeline uses ONNX Runtime's
+`CUDAExecutionProvider` with `IOBinding`, so the input tensor stays on
+GPU (zero-copy via `data_ptr()`). Portable across GPUs, no version lock.
+
+```bash
+yolo export model=detect14.pt format=onnx imgsz=1024 \
+    half=True dynamic=True simplify=True
+```
+
+Slightly slower than a matched TensorRT engine but far more portable — a
+good drop-in when you don't want to rebuild a TRT engine per machine.
 
 ## How It Works
 

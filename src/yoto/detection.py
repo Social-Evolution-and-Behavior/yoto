@@ -453,6 +453,150 @@ def _nv12_to_model_input(
     return torch.stack([r, g, b], dim=0).clamp_(0, 1)
 
 
+class _TRTModule:
+    """Direct TensorRT engine loader for ``.engine`` / ``.trt`` weights.
+
+    Ultralytics' ``AutoBackend`` manages internal CUDA binding addresses
+    that become corrupted when the backbone is called directly as
+    ``model.model(tensor)`` outside its ``predict`` loop.  That surfaces
+    as ``CUDA_ERROR_ILLEGAL_ADDRESS`` inside TensorRT's ``executeV2`` and
+    poisons the CUDA context — which in turn crashes ``PyNvVideoCodec``'s
+    NVDEC decoder.
+
+    This class bypasses ultralytics entirely: it strips ultralytics'
+    metadata prefix (4-byte LE length + UTF-8 JSON) from the engine
+    file, deserializes the raw TRT engine, and exposes a
+    ``__call__(tensor) -> tensor`` interface that matches the YOLO
+    backbone, so ``_pynvdec_predict`` works unchanged for both paths.
+
+    The engine must be exported with ``dynamic=True`` to accept variable
+    batch sizes:
+
+    .. code-block:: bash
+
+        yolo export model=detect14.pt format=engine imgsz=1024 \\
+            half=True batch=20 dynamic=True
+    """
+
+    def __init__(self, engine_path: str) -> None:
+        import json
+        import struct
+
+        import tensorrt as trt  # type: ignore[import-not-found]
+        import torch
+
+        with open(engine_path, "rb") as f:
+            meta_len = struct.unpack("<I", f.read(4))[0]
+            meta_json = f.read(meta_len).decode("utf-8")
+            engine_data = f.read()
+        self._meta = json.loads(meta_json)
+        self.names: dict[int, str] = self._meta.get("names", {})
+        self.nc: int = len(self.names) or 1
+
+        logger = trt.Logger(trt.Logger.WARNING)
+        runtime = trt.Runtime(logger)
+        self.engine = runtime.deserialize_cuda_engine(engine_data)
+        if self.engine is None:
+            # TensorRT writes the real reason to its Logger (see stderr).
+            # The most common cause is a TRT version mismatch between the
+            # engine and the installed tensorrt; engines are not portable
+            # across TRT versions or GPUs.
+            raise RuntimeError(
+                f"TensorRT failed to deserialize {engine_path} "
+                f"(installed tensorrt {trt.__version__}). "
+                "See the [TRT] [E] line above for details. If it says "
+                "'engine plan file is not compatible', re-export on this "
+                "machine: `yolo export model=<MODEL>.pt format=engine "
+                "imgsz=1024 half=True batch=20 dynamic=True`."
+            )
+        self.context = self.engine.create_execution_context()
+        # Dedicated non-default stream avoids TRT's extra
+        # cudaStreamSynchronize overhead on the default stream.
+        self._stream = torch.cuda.Stream()
+
+    def __call__(self, x: Any) -> Any:
+        import torch
+
+        # Engine I/O is float32; FP16 is internal.
+        if x.dtype != torch.float32:
+            x = x.float()
+        B, C, H, W = x.shape
+        self.context.set_input_shape("images", (B, C, H, W))
+        out_shape = self.context.get_tensor_shape("output0")
+        output = torch.empty(
+            tuple(out_shape), dtype=torch.float32, device=x.device
+        )
+        self.context.set_tensor_address("images", x.data_ptr())
+        self.context.set_tensor_address("output0", output.data_ptr())
+        self.context.execute_async_v3(self._stream.cuda_stream)
+        self._stream.synchronize()
+        return output
+
+
+class _ONNXModule:
+    """Direct ONNX Runtime loader for ``.onnx`` weights.
+
+    Uses the CUDA execution provider with ``IOBinding`` so the input
+    tensor stays on GPU (zero-copy via ``data_ptr()``).  Only the much
+    smaller output is copied back through CPU.  Exposes the same
+    ``__call__(tensor) -> tensor`` interface as ``_TRTModule``.
+    """
+
+    def __init__(self, onnx_path: str) -> None:
+        import ast
+
+        import onnxruntime as ort  # type: ignore[import-not-found]
+
+        providers = [
+            ("CUDAExecutionProvider", {"device_id": 0}),
+            "CPUExecutionProvider",
+        ]
+        self.session = ort.InferenceSession(onnx_path, providers=providers)
+        if "CUDAExecutionProvider" not in self.session.get_providers():
+            raise RuntimeError(
+                "onnxruntime could not use CUDAExecutionProvider. Install "
+                "`onnxruntime-gpu` and ensure CUDA/cuDNN versions match."
+            )
+
+        inp = self.session.get_inputs()[0]
+        out = self.session.get_outputs()[0]
+        self._input_name = inp.name
+        self._output_name = out.name
+        self._fp16 = inp.type == "tensor(float16)"
+
+        # Ultralytics embeds class names in the ONNX custom metadata map.
+        meta = self.session.get_modelmeta().custom_metadata_map
+        self.names: dict[int, str] = {}
+        if "names" in meta:
+            try:
+                self.names = ast.literal_eval(meta["names"])
+            except (ValueError, SyntaxError):
+                pass
+        self.nc: int = len(self.names) or 1
+
+    def __call__(self, x: Any) -> Any:
+        import numpy as np
+        import torch
+
+        x = (x.half() if self._fp16 else x.float()).contiguous()
+        np_dtype = np.float16 if self._fp16 else np.float32
+
+        io = self.session.io_binding()
+        io.bind_input(
+            name=self._input_name,
+            device_type="cuda",
+            device_id=0,
+            element_type=np_dtype,
+            shape=tuple(x.shape),
+            buffer_ptr=x.data_ptr(),
+        )
+        io.bind_output(self._output_name, device_type="cuda", device_id=0)
+        self.session.run_with_iobinding(io)
+        # Output is tiny compared to the image input; CPU hop is cheap.
+        out_np = io.get_outputs()[0].numpy()
+        return torch.from_numpy(out_np).to(x.device)
+
+
 def _pynvdec_predict(
     video_path: str,
     model_module: Any,
@@ -789,14 +933,24 @@ def run_detection_fast(
 
     start_time = time.time()
 
-    # Load models
+    # Load models.  For TensorRT engines we bypass ultralytics entirely
+    # (see _TRTModule docstring for why); .onnx files go through ONNX
+    # Runtime with the CUDA EP; .pt weights use the existing YOLO path.
+    seg_module: Any
     try:
-        seg_model = YOLO(yolo_weights, task="detect")
+        if yolo_weights.endswith((".engine", ".trt")):
+            seg_module = _TRTModule(yolo_weights)
+            yolo_nc = seg_module.nc
+        elif yolo_weights.endswith(".onnx"):
+            seg_module = _ONNXModule(yolo_weights)
+            yolo_nc = seg_module.nc
+        else:
+            seg_model = YOLO(yolo_weights, task="detect")
+            seg_module = seg_model.model.eval().half().cuda()
+            yolo_nc = getattr(seg_model.model, "nc", None) or 1
     except Exception as exc:
         raise ModelLoadError(yolo_weights, str(exc)) from exc
 
-    seg_module = seg_model.model.eval().half().cuda()
-    yolo_nc: int = getattr(seg_model.model, "nc", None) or 1
     detector = _create_detector(apriltag_params)
 
     debug_frame_limit = 500

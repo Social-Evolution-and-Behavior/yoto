@@ -35,6 +35,8 @@ dependencies = [
 fast = [
     "torch>=2.0",
     "pynvvideocodec>=2.0",
+    "tensorrt>=8.6",
+    "onnxruntime-gpu>=1.17",
 ]
 dev = [
     "pytest>=7.0",
