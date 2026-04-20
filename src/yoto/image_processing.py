@@ -61,9 +61,7 @@ def unsharp_mask(
     True
     """
     blurred = cv2.GaussianBlur(image, kernel_size, sigma)
-    sharpened: GrayImage = cv2.addWeighted(
-        image, 1 + amount, blurred, -amount, 0
-    )
+    sharpened: GrayImage = cv2.addWeighted(image, 1 + amount, blurred, -amount, 0)
     return sharpened
 
 

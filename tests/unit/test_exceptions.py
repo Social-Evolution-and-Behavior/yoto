@@ -19,9 +19,7 @@ class TestExceptionHierarchy:
         "exc_class",
         [VideoReadError, ModelLoadError, EncoderError],
     )
-    def test_inherits_from_yoto_error(
-        self, exc_class: type[YotoError]
-    ) -> None:
+    def test_inherits_from_yoto_error(self, exc_class: type[YotoError]) -> None:
         assert issubclass(exc_class, YotoError)
 
 

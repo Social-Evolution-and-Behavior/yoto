@@ -15,8 +15,6 @@ import pytest
 
 from yoto.cleaning import clean_tracking_data
 from yoto.constants import (
-    ASS_TYPE_INTERPOLATED,
-    ASS_TYPE_ORIGINAL,
     COL_ASS_TYPE,
     COL_CENTER_X,
     COL_CENTER_Y,
@@ -28,7 +26,9 @@ from yoto.constants import (
 class TestCleaningPipeline:
     """End-to-end tests for the cleaning pipeline."""
 
-    def _make_large_tracking_df(self, n_frames: int = 500, n_ids: int = 10) -> pd.DataFrame:
+    def _make_large_tracking_df(
+        self, n_frames: int = 500, n_ids: int = 10
+    ) -> pd.DataFrame:
         """Build a synthetic tracking DataFrame with realistic patterns."""
         rng = np.random.default_rng(123)
         frames = list(range(n_frames))
@@ -48,7 +48,9 @@ class TestCleaningPipeline:
 
             # Introduce a jump for every other tag
             if tag_id % 2 == 0:
-                jump_frame = rng.integers(100, 400)
+                lo = min(100, max(1, n_frames // 4))
+                hi = max(lo + 1, n_frames)
+                jump_frame = int(rng.integers(lo, hi))
                 x[jump_frame] = x[jump_frame - 1] + 500
                 y[jump_frame] = y[jump_frame - 1] + 500
 

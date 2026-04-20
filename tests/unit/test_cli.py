@@ -225,10 +225,9 @@ class TestRecordingDirForPickle:
     def test_pickle_next_to_video(self, tmp_path: object) -> None:
         pkl = tmp_path / "000000_apriltagDetect14.pkl"  # type: ignore[operator]
         pkl.touch()
-        assert (
-            _recording_dir_for_pickle(str(pkl))
-            == os.path.abspath(str(tmp_path))  # type: ignore[arg-type]
-        )
+        assert _recording_dir_for_pickle(str(pkl)) == os.path.abspath(
+            str(tmp_path)
+        )  # type: ignore[arg-type]
 
 
 class TestFindPickleForVideo:
@@ -245,10 +244,7 @@ class TestFindPickleForVideo:
         clean_dir.mkdir(parents=True)
         clean_pkl = clean_dir / "000000_apriltagDetect14_clean.pkl"
         clean_pkl.touch()
-        assert (
-            _find_pickle_for_video(str(video), "_apriltagDetect14")
-            == str(clean_pkl)
-        )
+        assert _find_pickle_for_video(str(video), "_apriltagDetect14") == str(clean_pkl)
 
     def test_falls_back_to_raw(self, tmp_path: object) -> None:
         rec = tmp_path  # type: ignore[assignment]
@@ -258,10 +254,7 @@ class TestFindPickleForVideo:
         raw_dir.mkdir(parents=True)
         raw_pkl = raw_dir / "000000_apriltagDetect14.pkl"
         raw_pkl.touch()
-        assert (
-            _find_pickle_for_video(str(video), "_apriltagDetect14")
-            == str(raw_pkl)
-        )
+        assert _find_pickle_for_video(str(video), "_apriltagDetect14") == str(raw_pkl)
 
     def test_falls_back_to_legacy(self, tmp_path: object) -> None:
         rec = tmp_path  # type: ignore[assignment]
@@ -269,10 +262,7 @@ class TestFindPickleForVideo:
         video.touch()
         legacy = rec / "000000_apriltagDetect14.pkl"
         legacy.touch()
-        assert (
-            _find_pickle_for_video(str(video), "_apriltagDetect14")
-            == str(legacy)
-        )
+        assert _find_pickle_for_video(str(video), "_apriltagDetect14") == str(legacy)
 
     def test_returns_none_if_nothing_found(self, tmp_path: object) -> None:
         video = tmp_path / "000000.mp4"  # type: ignore[operator]

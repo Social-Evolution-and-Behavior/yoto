@@ -334,9 +334,7 @@ def _reader_worker_ffmpeg(
         if len(raw) != byte_size:
             break
         yuv = (
-            np.frombuffer(raw, dtype=np.uint8)
-            .reshape(frame_h * 3 // 2, frame_w)
-            .copy()
+            np.frombuffer(raw, dtype=np.uint8).reshape(frame_h * 3 // 2, frame_w).copy()
         )
         read_q.put((fn, yuv))
         fn += 1
@@ -360,9 +358,7 @@ def _reader_worker_cv2(
         if short_mode and fn > 2000:
             break
         if do_resize:
-            frame = cv2.resize(
-                frame, (out_w, out_h), interpolation=cv2.INTER_LINEAR
-            )
+            frame = cv2.resize(frame, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
         read_q.put((fn, frame))
         fn += 1
     read_q.put(None)
@@ -475,9 +471,7 @@ def render_overlay_video(
             suffix = f"_{data_name}_scaled{scale:.2f}.mp4"
         else:
             suffix = f"_{data_name}.mp4"
-        output_path = os.path.join(
-            video_folder, "video_output", basename + suffix
-        )
+        output_path = os.path.join(video_folder, "video_output", basename + suffix)
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
     # Probe once via cv2 for size / fps / frame count metadata.
@@ -508,13 +502,9 @@ def render_overlay_video(
         cy = cy * scale
 
     rng = np.random.default_rng(TAG_COLOR_SEED)
-    tag_colors = [
-        tuple(int(c) for c in rng.integers(0, 255, 3)) for _ in id_list
-    ]
+    tag_colors = [tuple(int(c) for c in rng.integers(0, 255, 3)) for _ in id_list]
 
-    thickness = np.array(
-        [1] * 5 + [1] * 5 + [2] * 10 + [3] * 30, dtype=np.int32
-    )
+    thickness = np.array([1] * 5 + [1] * 5 + [2] * 10 + [3] * 30, dtype=np.int32)
 
     # Open decoder (ffmpeg + cuda hwaccel, then CPU, then cv2 fallback).
     ffmpeg_reader, first_frame_bytes = _open_ffmpeg_reader(

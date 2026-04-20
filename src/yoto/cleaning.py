@@ -112,9 +112,7 @@ def _delete_jump_blocks(
             continue
 
         rows = sub.index[list(idx)]
-        real_rows = rows[
-            sub.loc[rows, COL_ASS_TYPE].eq(ASS_TYPE_ORIGINAL)
-        ]
+        real_rows = rows[sub.loc[rows, COL_ASS_TYPE].eq(ASS_TYPE_ORIGINAL)]
 
         # Keep only the last real detection in the block
         if len(real_rows):
@@ -128,11 +126,7 @@ def _delete_jump_blocks(
     if not to_delete:
         return frame_data, pd.Index([])
 
-    del_idx = (
-        to_delete[0].append(to_delete[1:])
-        if len(to_delete) > 1
-        else to_delete[0]
-    )
+    del_idx = to_delete[0].append(to_delete[1:]) if len(to_delete) > 1 else to_delete[0]
 
     # Clear only this tag's data on the affected frames
     frame_data.loc[del_idx, (tag_id, list(delete_cols))] = np.nan
@@ -159,20 +153,14 @@ def _compute_distances(
     pd.DataFrame
         DataFrame with ``(tag_id, "distance")`` columns appended.
     """
-    x_vals = (
-        frame_data.xs(COL_CENTER_X, axis=1, level=1)[id_list].to_numpy()
-    )
-    y_vals = (
-        frame_data.xs(COL_CENTER_Y, axis=1, level=1)[id_list].to_numpy()
-    )
+    x_vals = frame_data.xs(COL_CENTER_X, axis=1, level=1)[id_list].to_numpy()
+    y_vals = frame_data.xs(COL_CENTER_Y, axis=1, level=1)[id_list].to_numpy()
 
     dx = np.diff(x_vals, axis=0)
     dy = np.diff(y_vals, axis=0)
     distances = np.sqrt(dx * dx + dy * dy)
 
-    out = np.full(
-        (x_vals.shape[0], x_vals.shape[1]), np.nan, dtype=float
-    )
+    out = np.full((x_vals.shape[0], x_vals.shape[1]), np.nan, dtype=float)
     out[1:, :] = distances
 
     dist_cols = pd.MultiIndex.from_product(
@@ -236,11 +224,7 @@ def clean_tracking_data(
     for tag_id in id_list:
         non_na_x = frame_data[tag_id][COL_CENTER_X].notna().sum()
         if non_na_x < min_detections:
-            columns_to_drop = [
-                col
-                for col in frame_data.columns
-                if col[0] == tag_id
-            ]
+            columns_to_drop = [col for col in frame_data.columns if col[0] == tag_id]
             frame_data = frame_data.drop(columns=columns_to_drop)
 
     frame_data.columns = frame_data.columns.remove_unused_levels()
@@ -248,9 +232,7 @@ def clean_tracking_data(
 
     # Baseline metrics
     total_samples = int(len(frame_data.index) * len(id_list))
-    original_non_na = frame_data.xs(
-        COL_CENTER_X, axis=1, level=1
-    )[id_list].notna()
+    original_non_na = frame_data.xs(COL_CENTER_X, axis=1, level=1)[id_list].notna()
     original_good_count = int(original_non_na.values.sum())
     original_missing_count = total_samples - original_good_count
 
@@ -275,35 +257,29 @@ def clean_tracking_data(
     # --- Step 3: first interpolation pass ---
     frame_data = _interpolate_data(frame_data, limit=interpolation_limit)
     for tag_id in id_list:
-        mask = (
-            frame_data[(tag_id, COL_ASS_TYPE)] == ASS_TYPE_NONE
-        ) & frame_data[(tag_id, COL_CENTER_X)].notna()
+        mask = (frame_data[(tag_id, COL_ASS_TYPE)] == ASS_TYPE_NONE) & frame_data[
+            (tag_id, COL_CENTER_X)
+        ].notna()
         frame_data.loc[mask, (tag_id, COL_ASS_TYPE)] = ASS_TYPE_INTERPOLATED
 
     # --- Step 4: compute distances ---
     frame_data = _compute_distances(frame_data, id_list)
 
     # --- Step 5: delete jumps ---
-    before_non_na = frame_data.xs(
-        COL_CENTER_X, axis=1, level=1
-    )[id_list].notna()
+    before_non_na = frame_data.xs(COL_CENTER_X, axis=1, level=1)[id_list].notna()
     for tag_id in id_list:
         frame_data, _ = _delete_jump_blocks(
             frame_data, tag_id, max_distance=max_jump_distance
         )
-    after_non_na = frame_data.xs(
-        COL_CENTER_X, axis=1, level=1
-    )[id_list].notna()
-    jump_deleted_count = int(
-        (before_non_na & ~after_non_na).values.sum()
-    )
+    after_non_na = frame_data.xs(COL_CENTER_X, axis=1, level=1)[id_list].notna()
+    jump_deleted_count = int((before_non_na & ~after_non_na).values.sum())
 
     # --- Step 6: re-interpolate after deletion ---
     frame_data = _interpolate_data(frame_data, limit=interpolation_limit)
     for tag_id in id_list:
-        mask = (
-            frame_data[(tag_id, COL_ASS_TYPE)] == ASS_TYPE_NONE
-        ) & frame_data[(tag_id, COL_CENTER_X)].notna()
+        mask = (frame_data[(tag_id, COL_ASS_TYPE)] == ASS_TYPE_NONE) & frame_data[
+            (tag_id, COL_CENTER_X)
+        ].notna()
         frame_data.loc[mask, (tag_id, COL_ASS_TYPE)] = ASS_TYPE_INTERPOLATED
 
         # Recompute per-ID distances
@@ -331,19 +307,13 @@ def clean_tracking_data(
         "original_missing_count": original_missing_count,
         "total_gaps": total_gaps,
         "error_pct": (
-            (100.0 * jump_deleted_count / total_detections)
-            if total_detections
-            else 0.0
+            (100.0 * jump_deleted_count / total_detections) if total_detections else 0.0
         ),
         "original_bad_pct": (
-            (100.0 * jump_deleted_count / total_samples)
-            if total_samples
-            else 0.0
+            (100.0 * jump_deleted_count / total_samples) if total_samples else 0.0
         ),
         "original_missing_pct": (
-            (100.0 * original_missing_count / total_samples)
-            if total_samples
-            else 0.0
+            (100.0 * original_missing_count / total_samples) if total_samples else 0.0
         ),
         "filled_count": filled_count,
         "filled_pct_of_total": (

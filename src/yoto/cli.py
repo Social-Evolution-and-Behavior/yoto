@@ -111,6 +111,7 @@ def _resolve_pickle_paths(path: str) -> list[str]:
     one level into sub-folders (each treated as its own recording dir).
     Files ending ``_clean.pkl`` are always excluded.
     """
+
     def _is_raw(f: str) -> bool:
         return f.endswith(".pkl") and not f.endswith("_clean.pkl")
 
@@ -202,7 +203,7 @@ def _configure_logging(debug: bool = False) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _add_detect_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
+def _add_detect_parser(subparsers: argparse._SubParsersAction) -> None:
     """Register the ``detect`` sub-command."""
     p = subparsers.add_parser(
         "detect",
@@ -340,10 +341,7 @@ def _format_tqdm_line(current: int, total: int, elapsed: float) -> str:
 
     rate = current / elapsed if elapsed > 0 else 0.0
     remaining = (total - current) / rate if rate > 0 and total > current else 0.0
-    return (
-        f"{current}/{total} "
-        f"[{_hms(elapsed)}<{_hms(remaining)}, {rate:.2f}it/s]"
-    )
+    return f"{current}/{total} " f"[{_hms(elapsed)}<{_hms(remaining)}, {rate:.2f}it/s]"
 
 
 def _write_progress_txt(
@@ -381,16 +379,16 @@ def _write_progress_txt(
                         runtime = 0.0
                     exitval = parts[6]
                     if 1 <= seq <= len(video_paths):
-                        completed.append(
-                            (seq, video_paths[seq - 1], runtime, exitval)
-                        )
+                        completed.append((seq, video_paths[seq - 1], runtime, exitval))
         except OSError:
             pass
 
     done_seqs = {s for s, *_ in completed}
     ok_count = sum(1 for _, _, _, e in completed if e == "0")
     fail_count = len(completed) - ok_count
-    elapsed = final_wall_time if final_wall_time is not None else _time.time() - start_time
+    elapsed = (
+        final_wall_time if final_wall_time is not None else _time.time() - start_time
+    )
     status = "FINISHED" if final_wall_time is not None else "RUNNING"
 
     lines: list[str] = []
@@ -399,9 +397,7 @@ def _write_progress_txt(
         f"Started:  "
         f"{datetime.datetime.fromtimestamp(start_time).strftime('%Y-%m-%d %H:%M:%S')}"
     )
-    lines.append(
-        f"Updated:  {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-    )
+    lines.append(f"Updated:  {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     lines.append(f"Elapsed:  {_format_duration(elapsed)}")
     lines.append(f"Status:   {status}")
     lines.append("")
@@ -432,9 +428,7 @@ def _write_progress_txt(
         active: list[tuple[int, str, str]] = []
         queued: list[tuple[int, str]] = []
         for seq, vpath in pending:
-            state = (
-                read_status(status_dir, vpath) if status_dir is not None else None
-            )
+            state = read_status(status_dir, vpath) if status_dir is not None else None
             if state is not None:
                 current, total, p_start, updated = state
                 # Treat a stale status file (>15s since last write) as queued.
@@ -450,16 +444,10 @@ def _write_progress_txt(
             queued.append((seq, vpath))
 
         lines.append("")
-        lines.append(
-            f"Remaining: {len(active)} running, {len(queued)} queued"
-        )
-        name_w = max(
-            (len(os.path.basename(p)) for _, p, _ in active), default=0
-        )
+        lines.append(f"Remaining: {len(active)} running, {len(queued)} queued")
+        name_w = max((len(os.path.basename(p)) for _, p, _ in active), default=0)
         for seq, vpath, tq in active:
-            lines.append(
-                f"  [{seq:>3}] {os.path.basename(vpath):<{name_w}}  {tq}"
-            )
+            lines.append(f"  [{seq:>3}] {os.path.basename(vpath):<{name_w}}  {tq}")
         for seq, vpath in queued[:10]:
             lines.append(f"  [{seq:>3}] {os.path.basename(vpath)}  (queued)")
         if len(queued) > 10:
@@ -535,10 +523,7 @@ def _run_parallel_gnu(
         *video_paths,
     ]
 
-    print(
-        f"Launching {jobs} GNU parallel workers "
-        f"for {len(video_paths)} video(s)."
-    )
+    print(f"Launching {jobs} GNU parallel workers " f"for {len(video_paths)} video(s).")
     print("")
     print("Check progress at any time with:")
     print(f"  cat {progress_txt}")
@@ -564,7 +549,11 @@ def _run_parallel_gnu(
 
     # Seed progress.txt before parallel starts so `cat` works immediately.
     _write_progress_txt(
-        progress_txt, video_paths, joblog, wall_start, jobs,
+        progress_txt,
+        video_paths,
+        joblog,
+        wall_start,
+        jobs,
         status_dir=status_dir,
     )
 
@@ -574,7 +563,11 @@ def _run_parallel_gnu(
     def _watch() -> None:
         while not stop_event.wait(3.0):
             _write_progress_txt(
-                progress_txt, video_paths, joblog, wall_start, jobs,
+                progress_txt,
+                video_paths,
+                joblog,
+                wall_start,
+                jobs,
                 status_dir=status_dir,
             )
 
@@ -589,7 +582,11 @@ def _run_parallel_gnu(
 
     wall_time = time.time() - wall_start
     _write_progress_txt(
-        progress_txt, video_paths, joblog, wall_start, jobs,
+        progress_txt,
+        video_paths,
+        joblog,
+        wall_start,
+        jobs,
         status_dir=status_dir,
         final_wall_time=wall_time,
     )
@@ -748,9 +745,7 @@ def _run_detect(args: argparse.Namespace) -> None:
             print("")
             print("Per-video runtime (longest first):")
             errors = {p: e for p, e in results}
-            for vpath, rt in sorted(
-                runtimes.items(), key=lambda x: x[1], reverse=True
-            ):
+            for vpath, rt in sorted(runtimes.items(), key=lambda x: x[1], reverse=True):
                 status = "OK  " if errors.get(vpath) is None else "FAIL"
                 name = os.path.basename(vpath)
                 print(f"  [{status}] {_format_duration(rt):>12}  {name}")
@@ -770,7 +765,7 @@ def _run_detect(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _add_clean_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
+def _add_clean_parser(subparsers: argparse._SubParsersAction) -> None:
     """Register the ``clean`` sub-command."""
     p = subparsers.add_parser(
         "clean",
@@ -832,9 +827,9 @@ def _clean_one_pickle(
             max_jump_distance=max_jump,
         )
         if output_path is None:
-            clean_dir = _tracking_layout(
-                _recording_dir_for_pickle(pkl_path)
-            )["clean_data"]
+            clean_dir = _tracking_layout(_recording_dir_for_pickle(pkl_path))[
+                "clean_data"
+            ]
             os.makedirs(clean_dir, exist_ok=True)
             stem = os.path.splitext(os.path.basename(pkl_path))[0]
             output_path = os.path.join(clean_dir, f"{stem}_clean.pkl")
@@ -912,7 +907,7 @@ def _run_clean(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _add_render_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
+def _add_render_parser(subparsers: argparse._SubParsersAction) -> None:
     """Register the ``render`` sub-command."""
     p = subparsers.add_parser(
         "render",
@@ -1017,9 +1012,7 @@ def _render_single_video(
         if pkl_override is not None:
             pkl_path: str | None = pkl_override
         else:
-            pkl_path = _find_pickle_for_video(
-                vpath, data_suffix, raw_only=raw
-            )
+            pkl_path = _find_pickle_for_video(vpath, data_suffix, raw_only=raw)
         if pkl_path is None or not os.path.isfile(pkl_path):
             where = (
                 "tracking/raw_data/"
@@ -1061,9 +1054,9 @@ def _render_single_video(
             )
 
         # Place the output under <recording>/tracking/video_output/.
-        video_out_dir = _tracking_layout(
-            _recording_dir_for_video(vpath)
-        )["video_output"]
+        video_out_dir = _tracking_layout(_recording_dir_for_video(vpath))[
+            "video_output"
+        ]
         os.makedirs(video_out_dir, exist_ok=True)
         stem = os.path.splitext(os.path.basename(vpath))[0]
         raw_tag = "_raw" if raw else ""
@@ -1203,9 +1196,7 @@ def _run_render(args: argparse.Namespace) -> None:
             print("")
             print("Per-video runtime (longest first):")
             errors = {p: e for p, e in results}
-            for vpath, rt in sorted(
-                runtimes.items(), key=lambda x: x[1], reverse=True
-            ):
+            for vpath, rt in sorted(runtimes.items(), key=lambda x: x[1], reverse=True):
                 status = "OK  " if errors.get(vpath) is None else "FAIL"
                 name = os.path.basename(vpath)
                 print(f"  [{status}] {_format_duration(rt):>12}  {name}")

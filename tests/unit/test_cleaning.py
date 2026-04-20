@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 import numpy as np
 import pandas as pd
 import pytest
@@ -13,8 +11,6 @@ from yoto.constants import (
     ASS_TYPE_INTERPOLATED,
     ASS_TYPE_ORIGINAL,
     COL_ASS_TYPE,
-    COL_CENTER_X,
-    COL_CENTER_Y,
     COL_DISTANCE,
 )
 
@@ -28,11 +24,9 @@ class TestInterpolateData:
         assert result["a"].notna().all()
 
     def test_respects_limit(self) -> None:
-        data = pd.DataFrame(
-            {"a": [1.0, np.nan, np.nan, np.nan, np.nan, 6.0]}
-        )
+        # Gap of 7 NaNs; limit=2 fills 2 from each end, leaving 3 NaN.
+        data = pd.DataFrame({"a": [1.0] + [np.nan] * 7 + [9.0]})
         result = _interpolate_data(data.copy(), limit=2)
-        # Gap of 4 > limit of 2, so middle values stay NaN
         assert result["a"].isna().sum() > 0
 
     def test_does_not_extrapolate(self) -> None:
@@ -102,12 +96,8 @@ class TestCleanTrackingData:
         for tag_id in id_list:
             assert (tag_id, COL_DISTANCE) in cleaned.columns
 
-    def test_metrics_structure(
-        self, sample_tracking_dataframe: pd.DataFrame
-    ) -> None:
-        _, _, metrics = clean_tracking_data(
-            sample_tracking_dataframe, min_detections=1
-        )
+    def test_metrics_structure(self, sample_tracking_dataframe: pd.DataFrame) -> None:
+        _, _, metrics = clean_tracking_data(sample_tracking_dataframe, min_detections=1)
         expected_keys = {
             "total_samples",
             "total_detections",
@@ -133,7 +123,7 @@ class TestCleanTrackingData:
         # total_samples = n_frames * n_ids
         assert metrics["total_samples"] == len(cleaned.index) * len(id_list)
 
-    @pytest.mark.parametrize("max_jump", [50.0, 100.0, 500.0])
+    @pytest.mark.parametrize("max_jump", [50.0, 100.0, 2000.0])
     def test_jump_detection_respects_threshold(
         self,
         sample_tracking_dataframe: pd.DataFrame,
@@ -144,6 +134,7 @@ class TestCleanTrackingData:
             min_detections=1,
             max_jump_distance=max_jump,
         )
-        # With a very large threshold, no jumps should be detected
-        if max_jump >= 500.0:
+        # The fixture's synthetic jump is ~673 px.  Above that, no jump
+        # should be flagged.
+        if max_jump >= 2000.0:
             assert metrics["original_bad_count"] == 0

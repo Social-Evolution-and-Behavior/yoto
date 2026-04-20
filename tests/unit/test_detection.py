@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
@@ -24,9 +24,16 @@ class TestBuildApriltagParams:
     def test_simple_params_has_required_keys(self) -> None:
         params = _build_apriltag_params_simple()
         required = {
-            "threads", "decimate", "blur", "refine_edges",
-            "decode_sharpening", "max_hamming", "kernel_size",
-            "sigma", "amount", "contrast_factor",
+            "threads",
+            "decimate",
+            "blur",
+            "refine_edges",
+            "decode_sharpening",
+            "max_hamming",
+            "kernel_size",
+            "sigma",
+            "amount",
+            "contrast_factor",
         }
         assert required.issubset(set(params.keys()))
 
@@ -83,9 +90,7 @@ class TestCropAndPack:
         self, sample_bgr_image: np.ndarray[Any, np.dtype[np.uint8]]
     ) -> None:
         boxes = np.array([[10.0, 10.0, 50.0, 50.0]], dtype=np.float64)
-        _, _, composite, _ = _crop_and_pack(
-            sample_bgr_image, boxes, pad_pixels=0
-        )
+        _, _, composite, _ = _crop_and_pack(sample_bgr_image, boxes, pad_pixels=0)
         assert composite is not None
         assert composite.ndim == 2  # should be grayscale
 
@@ -94,9 +99,7 @@ class TestCropAndPack:
     ) -> None:
         # Box at the edge — padding shouldn't go negative
         boxes = np.array([[0.0, 0.0, 10.0, 10.0]], dtype=np.float64)
-        crops, offsets, _, _ = _crop_and_pack(
-            sample_gray_image, boxes, pad_pixels=20
-        )
+        crops, offsets, _, _ = _crop_and_pack(sample_gray_image, boxes, pad_pixels=20)
         assert len(crops) == 1
         x_off, y_off = offsets[0]
         assert x_off >= 0

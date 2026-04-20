@@ -28,13 +28,11 @@ from typing import Any, Iterator
 import cv2
 import numpy as np
 import pandas as pd
-from PIL import Image, ImageEnhance
 from tqdm import tqdm
 from ultralytics import YOLO
 
 from yoto._types import BBoxArray, GrayImage, Image as ImageType
 from yoto.constants import (
-    ASS_TYPE_ORIGINAL,
     COL_CENTER_X,
     COL_CENTER_Y,
     COL_CORNERS,
@@ -68,7 +66,7 @@ from yoto.constants import (
     FAST_UNSHARP_SIGMA,
     MAX_VALID_TAG_ID,
 )
-from yoto.exceptions import ModelLoadError, VideoReadError
+from yoto.exceptions import ModelLoadError
 from yoto.image_processing import (
     contrast_enhance_cv2,
     contrast_enhance_pil,
@@ -200,9 +198,7 @@ def _crop_and_pack(
     if is_gray:
         composite = np.zeros((strip_height, strip_width), dtype=np.uint8)
     else:
-        composite = np.zeros(
-            (strip_height, strip_width, 3), dtype=np.uint8
-        )
+        composite = np.zeros((strip_height, strip_width, 3), dtype=np.uint8)
 
     x_cursor = 0
     canvas_x_offsets: list[int] = []
@@ -523,9 +519,7 @@ class _TRTModule:
         B, C, H, W = x.shape
         self.context.set_input_shape("images", (B, C, H, W))
         out_shape = self.context.get_tensor_shape("output0")
-        output = torch.empty(
-            tuple(out_shape), dtype=torch.float32, device=x.device
-        )
+        output = torch.empty(tuple(out_shape), dtype=torch.float32, device=x.device)
         self.context.set_tensor_address("images", x.data_ptr())
         self.context.set_tensor_address("output0", output.data_ptr())
         self.context.execute_async_v3(self._stream.cuda_stream)
@@ -641,7 +635,7 @@ def _pynvdec_predict(
     """
     import torch
     import PyNvVideoCodec as nvc  # type: ignore[import-untyped]
-    from ultralytics.utils.nms import non_max_suppression  # type: ignore[import-untyped]
+    from ultralytics.utils.nms import non_max_suppression
 
     dec = nvc.ThreadedDecoder(
         video_path,
@@ -785,9 +779,7 @@ def run_detection_simple(
     if output_path:
         os.makedirs(output_path, exist_ok=True)
         video_basename = os.path.basename(video_path).rsplit(".", 1)[0]
-        out_pkl = os.path.join(
-            output_path, video_basename + data_suffix + ".pkl"
-        )
+        out_pkl = os.path.join(output_path, video_basename + data_suffix + ".pkl")
     else:
         out_pkl = video_path.rsplit(".", 1)[0] + data_suffix + ".pkl"
 
@@ -916,8 +908,6 @@ def run_detection_fast(
     ModelLoadError
         If YOLO weights cannot be loaded.
     """
-    import torch
-
     if apriltag_params is None:
         apriltag_params = _build_apriltag_params_fast()
 
@@ -925,9 +915,7 @@ def run_detection_fast(
     if output_path:
         os.makedirs(output_path, exist_ok=True)
         video_basename = os.path.basename(video_path).rsplit(".", 1)[0]
-        out_pkl = os.path.join(
-            output_path, video_basename + data_suffix + ".pkl"
-        )
+        out_pkl = os.path.join(output_path, video_basename + data_suffix + ".pkl")
     else:
         out_pkl = video_path.rsplit(".", 1)[0] + data_suffix + ".pkl"
 

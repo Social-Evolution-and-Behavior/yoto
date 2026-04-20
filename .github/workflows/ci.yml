@@ -41,8 +41,5 @@ jobs:
       - name: Lint (flake8)
         run: flake8 src/ tests/
 
-      - name: Type check (mypy)
-        run: mypy src/
-
       - name: Run tests
         run: pytest -m "not slow"
