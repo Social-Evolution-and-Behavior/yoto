@@ -27,10 +27,14 @@ class ModelLoadError(YotoError):
 
 
 class EncoderError(YotoError):
-    """Raised when no working ffmpeg encoder can be found."""
+    """Raised when no working ffmpeg encoder can be found or when ffmpeg
+    dies mid-encode."""
 
-    def __init__(self) -> None:
+    def __init__(self, message: str | None = None) -> None:
         super().__init__(
-            "No working ffmpeg encoder found. "
-            "Install ffmpeg with nvenc or libx264 support."
+            message
+            or (
+                "No working ffmpeg encoder found. "
+                "Install ffmpeg with nvenc or libx264 support."
+            )
         )

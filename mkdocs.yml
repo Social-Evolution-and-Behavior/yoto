@@ -1,8 +1,8 @@
 site_name: YOTO
 site_description: GPU-accelerated AprilTag tracking pipeline for ant behavioral studies
-site_url: https://ychemtob.github.io/yoto
-repo_url: https://github.com/ychemtob/yoto
-repo_name: ychemtob/yoto
+site_url: https://github.com/Social-Evolution-and-Behavior/yoto
+repo_url: https://github.com/Social-Evolution-and-Behavior/yoto
+repo_name: Social-Evolution-and-Behavior/yoto
 
 theme:
   name: material
@@ -70,4 +70,4 @@ markdown_extensions:
 extra:
   social:
     - icon: fontawesome/brands/github
-      link: https://github.com/ychemtob/yoto
+      link: https://github.com/Social-Evolution-and-Behavior/yoto

@@ -1,4 +1,4 @@
-[![CI](https://github.com/ychemtob/yoto/actions/workflows/ci.yml/badge.svg)](https://github.com/ychemtob/yoto/actions/workflows/ci.yml)
+[![CI](https://github.com/Social-Evolution-and-Behavior/yoto/actions/workflows/ci.yml/badge.svg)](https://github.com/Social-Evolution-and-Behavior/yoto/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
 
@@ -10,7 +10,7 @@ GPU-accelerated AprilTag tracking pipeline for ant behavioral studies.
 
 - **Two detection pipelines**: portable simple mode and high-throughput NVDEC-accelerated fast mode
 - **Automated data cleaning**: removes spurious IDs, fills short gaps via interpolation, deletes tracking jumps
-- **Video overlay rendering**: annotated videos with per-tag labels, coloured motion trails, and frame counters
+- **Video overlay rendering**: annotated videos with per-tag labels, coloured motion trails, and frame counters — 3-thread ffmpeg pipeline (CUDA decode → draw → NVENC encode) for ~2-3× throughput over single-threaded `cv2.VideoWriter`
 - **Batch processing**: `--parallel N` on `detect` and `render` dispatches one worker per video via GNU parallel, with a live human-readable `progress.txt`
 - **CLI and Python API**: use from the command line or import into your analysis scripts
 
@@ -33,7 +33,7 @@ conda activate yoto
 pip install -e ".[dev,fast]"
 ```
 
-The `fast` extra pulls in `torch` and `pynvvideocodec` for the NVDEC pipeline.
+The `fast` extra pulls in `torch`, `pynvvideocodec`, `tensorrt`, and `onnxruntime-gpu` for the NVDEC detection pipeline. `.pt` weights work without any of these — the extras are only needed for `.engine`/`.trt`/`.onnx` weights.
 
 ## Quick Example
 
@@ -101,7 +101,7 @@ The launch banner prints the exact path.
 
 - Python ≥ 3.10
 - NVIDIA GPU with CUDA support
-- ffmpeg (for video rendering)
+- ffmpeg — built with NVENC encoders (`hevc_nvenc`, `h264_nvenc`) and `-hwaccel cuda` for the GPU render fast path; `libx264` + OpenCV decode are used as automatic fallbacks
 - [AprilTag](https://github.com/Social-Evolution-and-Behavior/apriltag) (LSEB fork)
 
 ## License

@@ -966,6 +966,14 @@ def _add_render_parser(subparsers: argparse._SubParsersAction) -> None:  # type:
         "use <1 for smaller text, e.g. 0.5)",
     )
     p.add_argument(
+        "--codec",
+        choices=("auto", "h264", "hevc"),
+        default="auto",
+        help="Video encoder family (default: auto = hevc_nvenc first, "
+        "then h264_nvenc, then libx264). Use 'h264' for smooth VLC "
+        "playback; 'hevc' for smaller files.",
+    )
+    p.add_argument(
         "--parallel",
         type=int,
         default=None,
@@ -993,6 +1001,7 @@ def _render_single_video(
     draw_trails: bool,
     text_scale_factor: float,
     raw: bool,
+    codec: str,
 ) -> tuple[str, str | None]:
     """Render one video. Returns ``(vpath, None)`` on success, or
     ``(vpath, traceback_text)`` on failure."""
@@ -1074,6 +1083,7 @@ def _render_single_video(
             short=short,
             draw_trails=draw_trails,
             text_scale_factor=text_scale_factor,
+            codec=codec,
         )
         print(f"Output: {output}")
         return (vpath, None)
@@ -1134,6 +1144,7 @@ def _run_render(args: argparse.Namespace) -> None:
         worker_tmpl.extend(["--dataname", args.dataname])
         worker_tmpl.extend(["--scale", str(args.scale)])
         worker_tmpl.extend(["--text-scale", str(args.text_scale)])
+        worker_tmpl.extend(["--codec", args.codec])
         if args.short:
             worker_tmpl.append("--short")
         if args.no_trails:
@@ -1165,6 +1176,7 @@ def _run_render(args: argparse.Namespace) -> None:
                 draw_trails=(not args.no_trails) and (not args.raw),
                 text_scale_factor=args.text_scale,
                 raw=args.raw,
+                codec=args.codec,
             )
             if result[1] is not None:
                 logging.getLogger(__name__).error(

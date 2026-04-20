@@ -60,10 +60,10 @@ lint = [
 yoto = "yoto.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/ychemtob/yoto"
-Documentation = "https://ychemtob.github.io/yoto"
-Repository = "https://github.com/ychemtob/yoto"
-Issues = "https://github.com/ychemtob/yoto/issues"
+Homepage = "https://github.com/Social-Evolution-and-Behavior/yoto"
+Documentation = "https://github.com/Social-Evolution-and-Behavior/yoto"
+Repository = "https://github.com/Social-Evolution-and-Behavior/yoto"
+Issues = "https://github.com/Social-Evolution-and-Behavior/yoto/issues"
 
 [tool.hatch.version]
 path = "src/yoto/__init__.py"
