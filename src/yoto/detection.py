@@ -513,16 +513,31 @@ class _TRTModule:
     def __call__(self, x: Any) -> Any:
         import torch
 
-        # Engine I/O is float32; FP16 is internal.
-        if x.dtype != torch.float32:
-            x = x.float()
-        B, C, H, W = x.shape
-        self.context.set_input_shape("images", (B, C, H, W))
-        out_shape = self.context.get_tensor_shape("output0")
-        output = torch.empty(tuple(out_shape), dtype=torch.float32, device=x.device)
-        self.context.set_tensor_address("images", x.data_ptr())
-        self.context.set_tensor_address("output0", output.data_ptr())
-        self.context.execute_async_v3(self._stream.cuda_stream)
+        # The caller produces ``x`` on the current (usually default) CUDA
+        # stream.  TRT runs on self._stream, and any half->float cast
+        # must also run on self._stream so the cast + TRT read share one
+        # stream.  We therefore:
+        #   1. make self._stream wait for the current stream (so the
+        #      original x is fully produced before we read it),
+        #   2. do the cast + TRT enqueue on self._stream,
+        #   3. CPU-synchronize on self._stream so the caller can read
+        #      ``output`` on whatever stream it likes.
+        # Without step (1), TRT sporadically read half-written input
+        # memory and produced a batch of zero detections — the cause of
+        # the "all IDs disappear for a few frames" bug.
+        current = torch.cuda.current_stream(x.device)
+        self._stream.wait_stream(current)
+        with torch.cuda.stream(self._stream):
+            if x.dtype != torch.float32:
+                x = x.float()
+            x = x.contiguous()
+            B, C, H, W = x.shape
+            self.context.set_input_shape("images", (B, C, H, W))
+            out_shape = self.context.get_tensor_shape("output0")
+            output = torch.empty(tuple(out_shape), dtype=torch.float32, device=x.device)
+            self.context.set_tensor_address("images", x.data_ptr())
+            self.context.set_tensor_address("output0", output.data_ptr())
+            self.context.execute_async_v3(self._stream.cuda_stream)
         self._stream.synchronize()
         return output
 
