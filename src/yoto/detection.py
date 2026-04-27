@@ -739,6 +739,16 @@ def _pynvdec_predict(
 # ---------------------------------------------------------------------------
 
 
+def _probe_frame_count(video_path: str, fallback: int = 18000) -> int:
+    """Return the video's frame count via OpenCV, or *fallback* on error."""
+    cap = cv2.VideoCapture(video_path)
+    try:
+        n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    finally:
+        cap.release()
+    return n if n > 0 else fallback
+
+
 def run_detection_simple(
     video_path: str,
     output_path: str | None = None,
@@ -746,7 +756,7 @@ def run_detection_simple(
     data_suffix: str = "_apriltagDetect14",
     conf_threshold: float = DEFAULT_CONF_THRESHOLD,
     pad_pixels: int = DEFAULT_PAD_PIXELS,
-    num_frames: int = 18000,
+    num_frames: int | None = None,
     apriltag_params: dict[str, Any] | None = None,
 ) -> pd.DataFrame:
     """Run the simple (portable) YOLO + AprilTag detection pipeline.
@@ -789,6 +799,9 @@ def run_detection_simple(
     """
     if apriltag_params is None:
         apriltag_params = _build_apriltag_params_simple()
+
+    if num_frames is None:
+        num_frames = _probe_frame_count(video_path)
 
     # Resolve output path
     if output_path:
@@ -874,7 +887,7 @@ def run_detection_fast(
     pad_pixels: int = DEFAULT_PAD_PIXELS,
     batch_size: int = DEFAULT_BATCH_SIZE,
     target_size: int = DEFAULT_TARGET_SIZE,
-    num_frames: int = 18000,
+    num_frames: int | None = None,
     debug: bool = False,
     apriltag_params: dict[str, Any] | None = None,
 ) -> pd.DataFrame:
@@ -925,6 +938,9 @@ def run_detection_fast(
     """
     if apriltag_params is None:
         apriltag_params = _build_apriltag_params_fast()
+
+    if num_frames is None:
+        num_frames = _probe_frame_count(video_path)
 
     # Resolve output path
     if output_path:
