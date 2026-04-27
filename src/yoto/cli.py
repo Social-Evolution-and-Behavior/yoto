@@ -103,7 +103,7 @@ def _resolve_video_paths(path: str) -> list[str]:
     return videos
 
 
-def _resolve_pickle_paths(path: str) -> list[str]:
+def _resolve_pickle_paths(path: str, data_suffix: str = "") -> list[str]:
     """Resolve *path* to a list of raw-detection pickle files.
 
     For a directory, prefers ``{path}/tracking/raw_data/`` when it exists;
@@ -129,6 +129,12 @@ def _resolve_pickle_paths(path: str) -> list[str]:
         return _pickles_in(d)
 
     if os.path.isfile(path):
+        # If a video file was passed, find its raw-detection pickle.
+        if os.path.splitext(path)[1].lower() in VIDEO_EXTENSIONS:
+            pkl = _find_pickle_for_video(path, data_suffix, raw_only=True)
+            if pkl is None:
+                return [path]  # let downstream raise a clear error
+            return [pkl]
         return [path]
     if not os.path.isdir(path):
         return [path]  # let downstream raise a clear error
@@ -773,9 +779,16 @@ def _add_clean_parser(subparsers: argparse._SubParsersAction) -> None:
     )
     p.add_argument(
         "input_pkl",
-        help="Path to a raw-detection pickle file, a directory of pickles, "
+        help="Path to a raw-detection pickle, a video file (the matching "
+        "raw pickle is looked up via --dataname), a directory of pickles, "
         "or a directory of recording sub-folders. Files ending "
         "'_clean.pkl' are skipped.",
+    )
+    p.add_argument(
+        "--dataname",
+        default="_apriltagDetect14",
+        help="Suffix used to locate the raw pickle when a video file is "
+        "passed as input (default: _apriltagDetect14)",
     )
     p.add_argument(
         "-o",
@@ -852,7 +865,7 @@ def _run_clean(args: argparse.Namespace) -> None:
     """Execute the clean sub-command."""
     _configure_logging(False)
 
-    pkl_paths = _resolve_pickle_paths(args.input_pkl)
+    pkl_paths = _resolve_pickle_paths(args.input_pkl, args.dataname)
     if not pkl_paths:
         print(f"No raw-detection pickle files found in: {args.input_pkl}")
         sys.exit(1)
