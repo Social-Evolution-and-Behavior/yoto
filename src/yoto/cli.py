@@ -60,6 +60,14 @@ def _recording_dir_for_pickle(pkl_path: str) -> str:
     return parent
 
 
+def _normalize_dataname(name: str) -> str:
+    """Ensure the dataname suffix begins with an underscore so it is
+    visually separated from the video stem in output filenames."""
+    if not name:
+        return name
+    return name if name.startswith("_") else "_" + name
+
+
 def _resolve_video_paths(path: str) -> list[str]:
     """Resolve *path* to a list of video file paths.
 
@@ -647,6 +655,7 @@ def _run_parallel_gnu(
 def _run_detect(args: argparse.Namespace) -> None:
     """Execute the detect sub-command."""
     _configure_logging(args.debug)
+    args.dataname = _normalize_dataname(args.dataname)
 
     video_paths = _resolve_video_paths(args.video)
     if not video_paths:
@@ -815,6 +824,14 @@ def _add_clean_parser(subparsers: argparse._SubParsersAction) -> None:
         default=100.0,
         help="Max pixel distance before jump deletion (default: 100)",
     )
+    p.add_argument(
+        "--video-nb",
+        type=int,
+        default=None,
+        metavar="INDEX",
+        help="When input is a recording directory, clean only the pickle "
+        "for the video at this 0-based index in the resolved video list",
+    )
     p.set_defaults(func=_run_clean)
 
 
@@ -864,8 +881,35 @@ def _clean_one_pickle(
 def _run_clean(args: argparse.Namespace) -> None:
     """Execute the clean sub-command."""
     _configure_logging(False)
+    args.dataname = _normalize_dataname(args.dataname)
 
-    pkl_paths = _resolve_pickle_paths(args.input_pkl, args.dataname)
+    if args.video_nb is not None:
+        # Resolve videos in the directory, pick one, then look up its
+        # raw pickle by --dataname suffix.
+        video_paths = _resolve_video_paths(args.input_pkl)
+        if not video_paths:
+            print(f"No video files found in: {args.input_pkl}")
+            sys.exit(1)
+        if args.video_nb < 0 or args.video_nb >= len(video_paths):
+            print(
+                f"Error: --video-nb {args.video_nb} out of range "
+                f"(found {len(video_paths)} video(s), valid indices "
+                f"0..{len(video_paths) - 1})"
+            )
+            sys.exit(1)
+        selected = video_paths[args.video_nb]
+        print(f"Selected video [{args.video_nb}]: {selected}")
+        pkl = _find_pickle_for_video(selected, args.dataname, raw_only=True)
+        if pkl is None:
+            print(
+                f"No raw pickle found for {selected} "
+                f"(suffix {args.dataname!r})"
+            )
+            sys.exit(1)
+        pkl_paths = [pkl]
+    else:
+        pkl_paths = _resolve_pickle_paths(args.input_pkl, args.dataname)
+
     if not pkl_paths:
         print(f"No raw-detection pickle files found in: {args.input_pkl}")
         sys.exit(1)
@@ -1100,6 +1144,7 @@ def _render_single_video(
 def _run_render(args: argparse.Namespace) -> None:
     """Execute the render sub-command."""
     _configure_logging(False)
+    args.dataname = _normalize_dataname(args.dataname)
 
     video_paths = _resolve_video_paths(args.video_path)
     if not video_paths:
