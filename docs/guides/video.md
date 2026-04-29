@@ -4,23 +4,35 @@ Render annotated videos showing tag labels and motion trails.
 
 ## Usage
 
+### Command line
+
+```bash
+# Single video — pickle is auto-resolved from <recording>/tracking/clean_data/
+yoto render /path/to/experiment.mp4
+
+# Half-resolution H.264 preview
+yoto render /path/to/experiment.mp4 --scale 0.5 --codec h264
+
+# Batch over a directory tree, 3 workers in parallel
+yoto render /path/to/recordings/ --parallel 3
+
+# Render the raw (uninterpolated) detections
+yoto render /path/to/experiment.mp4 --raw --no-trails
+```
+
+### Python API
+
 ```python
 from yoto.video import render_overlay_video
 
 render_overlay_video(
-    "input.mp4",
+    "/path/to/experiment.mp4",
     cleaned_dataframe,
     id_list,
     scale=0.5,        # half-resolution output
     short=True,       # first 2000 frames only
     codec="auto",     # "auto" (HEVC first), "hevc", or "h264"
 )
-```
-
-From the CLI:
-
-```bash
-yoto render experiment.mp4 --scale 0.5 --codec h264
 ```
 
 ## Features

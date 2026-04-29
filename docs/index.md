@@ -2,35 +2,34 @@
 
 **GPU-accelerated AprilTag tracking pipeline for ant behavioral studies.**
 
-YOTO provides a complete workflow for detecting AprilTag barcodes on ants
-using YOLO object detection, with tools for data cleaning, interpolation,
-and video overlay visualization.
+YOTO is a hybrid pipeline for fast and reliable tracking of fiducial-marked insects. Running AprilTag directly on a high-resolution video frame is slow, because the decoder scans the whole image looking for quads. YOTO splits the work into two stages and only runs the expensive decoder on the parts of the frame that matter:
+
+1. **Stage 1 — YOLO detection.** A lightweight YOLO model trained on a small (auto-generated) dataset locates marker regions in the full frame. YOLO is fast and accurate at finding small tags in large images.
+2. **Stage 2 — AprilTag decoding.** Detected regions are cropped and packed into a compact composite, and the AprilTag library decodes tag IDs from that composite. Restricting AprilTag to small cropped regions preserves its decoding accuracy while drastically reducing its cost.
+
+In a reference benchmark, 7 days of 10 fps 4512×4512 footage of 100 clonal raider ants was processed in under 9 hours — roughly a week's worth of compute on a classical full-frame AprilTag pipeline.
 
 ## Features
 
-- **Two detection pipelines**: a portable simple mode and a high-throughput
-  NVDEC-accelerated fast mode
-- **Automated data cleaning**: removes spurious IDs, fills short tracking
-  gaps via interpolation, detects and deletes unrealistic jumps
-- **Video overlay rendering**: produces annotated videos with per-tag
-  labels, coloured motion trails, and frame counters
-- **Batch processing**: bash script to process entire experiment folders
-  with structured output directories
-- **CLI and Python API**: use from the command line or import into your
-  own analysis scripts
+- **Two-stage detection** (YOLO → AprilTag): an order-of-magnitude faster than running AprilTag on full frames, with fewer false positives in busy scenes
+- **End-to-end pipeline**: `detect → clean → render` — raw decode, automatic gap-filling and jump-detection on trajectories, and overlay-video rendering
+- **GPU end-to-end**: NVDEC decode → TensorRT / ONNX YOLO inference → AprilTag → NVENC encode; threaded ffmpeg render ~2–3× faster than single-threaded `cv2.VideoWriter`
+- **AprilTag presets**: swap detection / image-processing parameters non-destructively via `--apriltag-preset` (built-in `ir` preset, plus support for any JSON file including Optuna `best_params*.json` dumps)
+- **Two detection backends**: portable simple mode (any CUDA box) and NVDEC-accelerated fast mode for production runs
+- **Batch processing**: `--parallel N` on `detect` / `render` dispatches one worker per video via GNU parallel, with a live human-readable `progress.txt`
+- **CLI and Python API**: use from the command line or import into your analysis scripts
 
 ## Quick Example
 
-```python
-from yoto import run_detection_simple, clean_tracking_data, render_overlay_video
+```bash
+# Step 1: Detect tags (NVDEC fast pipeline + TensorRT engine)
+yoto detect /path/to/recording --yoloweights models/detect14.pt --fast --parallel 5
 
-# Step 1: Detect tags
-df = run_detection_simple("experiment.mp4", yolo_weights="detect14.engine")
+# Step 2: Clean and interpolate the raw tracking data
+yoto clean /path/to/recording
 
-# Step 2: Clean and interpolate
-cleaned, ids, metrics = clean_tracking_data(df)
-print(f"Error rate: {metrics['error_pct']:.2f}%")
-
-# Step 3: Render overlay video
-render_overlay_video("experiment.mp4", cleaned, ids)
+# Step 3: Render the overlay video
+yoto render /path/to/recording --short --scale 0.5
 ```
+
+You can also point any of the commands at a recording directory or a tree of recordings; see the [Quickstart](guides/quickstart.md) for details.

@@ -13,11 +13,31 @@ reliable trajectories.
 
 ## Usage
 
+### Command line
+
+```bash
+# Pass a video, a raw pickle, or a directory tree of recordings.
+yoto clean /path/to/experiment.mp4
+yoto clean /path/to/recordings/
+
+# Override defaults
+yoto clean /path/to/experiment.mp4 \
+    --min-detections 100 \
+    --interp-limit 5 \
+    --max-jump 100
+```
+
+When a video file is passed, `yoto clean` finds the matching raw pickle in
+`<recording>/tracking/raw_data/` (using `--dataname` for the suffix, default
+`_apriltagDetect14`).
+
+### Python API
+
 ```python
 from yoto.cleaning import clean_tracking_data
 import pandas as pd
 
-df = pd.read_pickle("raw_tracking.pkl")
+df = pd.read_pickle("/path/to/raw_tracking.pkl")
 cleaned, ids, metrics = clean_tracking_data(
     df,
     min_detections=100,
