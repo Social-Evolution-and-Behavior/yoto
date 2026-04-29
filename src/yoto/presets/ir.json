@@ -1,0 +1,22 @@
+{
+  "_description": "Infrared lighting preset (Optuna trial 823, score 0.9188).",
+  "amount": 5.0,
+  "blur": 1.0,
+  "contrast_factor": 3.0,
+  "contrast_method": "simple",
+  "decimate": 2.0,
+  "decode_sharpening": 11.5,
+  "invert": false,
+  "kernel_size": 11,
+  "max_hamming": 3,
+  "refine_edges": 0,
+  "sigma": 2.9,
+  "tone_map": "sqrt",
+  "upscale": 1.5,
+  "upscale_interp": "lanczos",
+  "use_bilateral": false,
+  "use_gamma": false,
+  "use_median_blur": false,
+  "use_unsharp": true,
+  "use_wiener": false
+}

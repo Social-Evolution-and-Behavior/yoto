@@ -97,6 +97,58 @@ def contrast_enhance_pil(
     return np.array(enhanced, dtype=np.uint8)
 
 
+def upscale(
+    image: GrayImage,
+    factor: float,
+    interp: str = "lanczos",
+) -> GrayImage:
+    """Upscale a grayscale image by *factor* using OpenCV interpolation."""
+    if factor == 1.0:
+        return image
+    interp_map = {
+        "lanczos": cv2.INTER_LANCZOS4,
+        "cubic": cv2.INTER_CUBIC,
+        "linear": cv2.INTER_LINEAR,
+        "nearest": cv2.INTER_NEAREST,
+    }
+    h, w = image.shape[:2]
+    out: GrayImage = cv2.resize(
+        image,
+        (int(round(w * factor)), int(round(h * factor))),
+        interpolation=interp_map.get(interp, cv2.INTER_LANCZOS4),
+    )
+    return out
+
+
+def tone_map(image: GrayImage, method: str) -> GrayImage:
+    """Apply a per-pixel tone curve. Supported: ``sqrt``, ``log``, ``none``."""
+    if method in (None, "none"):
+        return image
+    f = image.astype(np.float32) / 255.0
+    if method == "sqrt":
+        f = np.sqrt(f)
+    elif method == "log":
+        f = np.log1p(f * (np.e - 1.0))
+    else:
+        return image
+    out: GrayImage = np.clip(f * 255.0, 0, 255).astype(np.uint8)
+    return out
+
+
+def gamma_correct(image: GrayImage, gamma: float) -> GrayImage:
+    """Apply gamma correction (output = input^(1/gamma))."""
+    inv = 1.0 / max(gamma, 1e-6)
+    lut = np.array([((i / 255.0) ** inv) * 255 for i in range(256)], dtype=np.uint8)
+    out: GrayImage = cv2.LUT(image, lut)
+    return out
+
+
+def invert(image: GrayImage) -> GrayImage:
+    """Return the photographic negative of a uint8 grayscale image."""
+    out: GrayImage = cv2.bitwise_not(image)
+    return out
+
+
 def contrast_enhance_cv2(
     image: GrayImage,
     alpha: float = 2.0,

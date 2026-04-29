@@ -266,6 +266,15 @@ def _add_detect_parser(subparsers: argparse._SubParsersAction) -> None:
         "(useful for re-running a single failed video)",
     )
     p.add_argument(
+        "--apriltag-preset",
+        default=None,
+        metavar="NAME_OR_PATH",
+        help="AprilTag preset to apply on top of the pipeline defaults. "
+        "Either a built-in preset name (e.g. 'ir') or a path to a JSON "
+        "file (e.g. an Optuna best_params_*.json). Defaults stay untouched "
+        "when omitted.",
+    )
+    p.add_argument(
         "--debug",
         action="store_true",
         help="Enable debug profiling output",
@@ -280,6 +289,7 @@ def _run_single_video(
     yolo_weights: str,
     data_suffix: str,
     debug: bool,
+    preset: str | None = None,
 ) -> tuple[str, str | None]:
     """Run detection on one video. Returns ``(vpath, None)`` on success,
     or ``(vpath, traceback_text)`` on failure."""
@@ -298,6 +308,7 @@ def _run_single_video(
                 yolo_weights=yolo_weights,
                 data_suffix=data_suffix,
                 debug=debug,
+                preset=preset,
             )
         else:
             from yoto.detection import run_detection_simple
@@ -307,6 +318,7 @@ def _run_single_video(
                 output_path=output_dir,
                 yolo_weights=yolo_weights,
                 data_suffix=data_suffix,
+                preset=preset,
             )
         return (vpath, None)
     except Exception:
@@ -327,6 +339,8 @@ def _build_worker_cmd(
         cmd.append("--fast")
     if args.debug:
         cmd.append("--debug")
+    if getattr(args, "apriltag_preset", None):
+        cmd.extend(["--apriltag-preset", args.apriltag_preset])
     return cmd
 
 
@@ -712,6 +726,8 @@ def _run_detect(args: argparse.Namespace) -> None:
             worker_tmpl.append("--fast")
         if args.debug:
             worker_tmpl.append("--debug")
+        if args.apriltag_preset:
+            worker_tmpl.extend(["--apriltag-preset", args.apriltag_preset])
         input_root = (
             args.video
             if os.path.isdir(args.video)
@@ -735,6 +751,7 @@ def _run_detect(args: argparse.Namespace) -> None:
                 yolo_weights=args.yoloweights,
                 data_suffix=args.dataname,
                 debug=args.debug,
+                preset=args.apriltag_preset,
             )
             if result[1] is not None:
                 logging.getLogger(__name__).error(
@@ -901,10 +918,7 @@ def _run_clean(args: argparse.Namespace) -> None:
         print(f"Selected video [{args.video_nb}]: {selected}")
         pkl = _find_pickle_for_video(selected, args.dataname, raw_only=True)
         if pkl is None:
-            print(
-                f"No raw pickle found for {selected} "
-                f"(suffix {args.dataname!r})"
-            )
+            print(f"No raw pickle found for {selected} " f"(suffix {args.dataname!r})")
             sys.exit(1)
         pkl_paths = [pkl]
     else:

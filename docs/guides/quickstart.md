@@ -13,7 +13,14 @@ yoto detect experiment.mp4 --fast
 
 # Custom weights and output directory
 yoto detect experiment.mp4 output/ --yoloweights best.engine --fast
+
+# Apply an AprilTag preset (built-in name, or path to a JSON file)
+yoto detect experiment.mp4 --fast --apriltag-preset ir
+yoto detect experiment.mp4 --fast --apriltag-preset /path/to/best_params.json
 ```
+
+See [Detection → AprilTag Presets](detection.md#apriltag-presets) for the
+full list of recognised keys and how to add your own preset.
 
 ### 2. Clean the raw tracking data
 

@@ -71,13 +71,77 @@ yolo export model=detect14.pt format=onnx imgsz=1024 \
 Slightly slower than a matched TensorRT engine but far more portable — a
 good drop-in when you don't want to rebuild a TRT engine per machine.
 
+## AprilTag Presets
+
+The image-processing and AprilTag-decoder parameters used by both
+pipelines can be overridden by a **preset** — a JSON file of parameter
+values that are merged on top of the built-in defaults. Unspecified
+keys keep their defaults, so presets are non-destructive and trivially
+reversible (omit the flag to revert).
+
+```bash
+# Built-in preset (looked up in src/yoto/presets/)
+yoto detect video.mp4 --fast --apriltag-preset ir
+
+# Or a JSON file on disk (e.g. an Optuna best-params dump)
+yoto detect video.mp4 --fast --apriltag-preset /path/to/best_params.json
+```
+
+From Python:
+
+```python
+run_detection_fast(
+    "video.mp4",
+    yolo_weights="detect14.engine",
+    preset="ir",  # or "/path/to/best_params.json"
+)
+```
+
+### Preset file format
+
+Two on-disk shapes are accepted:
+
+1. **Flat dict** of parameters (the format used by built-in presets):
+
+   ```json
+   {
+     "upscale": 1.5,
+     "tone_map": "sqrt",
+     "decode_sharpening": 11.5,
+     "max_hamming": 3
+   }
+   ```
+
+2. **Optuna-style dump** with a top-level `"params"` key (also typically
+   containing `"score"` / `"metrics"`); only the `"params"` sub-dict is
+   read.
+
+### Recognised keys
+
+| Key                                                  | Default          | Effect when set                           |
+| ---------------------------------------------------- | ---------------- | ----------------------------------------- |
+| `invert`                                             | `false`          | Photographic negative before processing   |
+| `upscale`, `upscale_interp`                          | `1.0`, `lanczos` | Resize composite before detection         |
+| `tone_map`                                           | `none`           | `sqrt` or `log` per-pixel curve           |
+| `use_gamma`, `gamma`                                 | `false`, `1.0`   | Gamma correction                          |
+| `use_median_blur`, `median_kernel`                   | `false`, `3`     | Median blur (kernel forced odd)           |
+| `use_bilateral`, `bilateral_d`/`sigma_color`/`sigma_space` | `false`    | Edge-preserving smoothing                 |
+| `use_unsharp`, `kernel_size`, `sigma`, `amount`      | `true`, …        | Unsharp-mask sharpening                   |
+| `contrast_method`                                    | `simple`         | `simple` (PIL) or `cv2` contrast          |
+| `contrast_factor` (simple) / `cv2_alpha`, `cv2_beta` | …                | Contrast strength                         |
+| `decimate`, `blur`, `refine_edges`, `decode_sharpening`, `max_hamming` | …      | Forwarded to the AprilTag detector |
+
+The shipped `ir.json` preset was produced by an Optuna sweep on
+infrared-illuminated footage; new presets can be dropped into
+`src/yoto/presets/` to be discovered by name.
+
 ## How It Works
 
 1. **YOLO detection** — a trained YOLOv8 model locates ant bounding boxes
 2. **Cropping** — detected regions are padded and cropped from the frame
 3. **Composite strip** — crops are packed side-by-side into one wide image
 4. **Image enhancement** — unsharp masking and contrast boosting
-5. **AprilTag decoding** — the SEBLab detector runs once on the composite
+5. **AprilTag decoding** — the SEBLab detector runs once on the composite (parameters configurable via a preset; see above)
 6. **Reprojection** — tag coordinates are mapped back to the original frame
 
 ## Output Format

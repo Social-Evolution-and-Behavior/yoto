@@ -9,6 +9,7 @@ GPU-accelerated AprilTag tracking pipeline for ant behavioral studies.
 ## Features
 
 - **Two detection pipelines**: portable simple mode and high-throughput NVDEC-accelerated fast mode
+- **AprilTag presets**: swap detection / image-processing parameters non-destructively via `--apriltag-preset` (built-in `ir` preset shipped, plus support for any JSON file — including Optuna `best_params*.json` dumps)
 - **Automated data cleaning**: removes spurious IDs, fills short gaps via interpolation, deletes tracking jumps
 - **Video overlay rendering**: annotated videos with per-tag labels, coloured motion trails, and frame counters — 3-thread ffmpeg pipeline (CUDA decode → draw → NVENC encode) for ~2-3× throughput over single-threaded `cv2.VideoWriter`
 - **Batch processing**: `--parallel N` on `detect` and `render` dispatches one worker per video via GNU parallel, with a live human-readable `progress.txt`
@@ -56,6 +57,7 @@ render_overlay_video("experiment.mp4", cleaned, ids, scale=0.5)
 ```bash
 # Detect tags (single file, directory of videos, or directory of recording sub-folders)
 yoto detect experiment.mp4 --fast
+yoto detect experiment.mp4 --fast --apriltag-preset ir   # IR-illuminated footage
 yoto detect /data/recordings/ --parallel 3
 
 # Clean raw data

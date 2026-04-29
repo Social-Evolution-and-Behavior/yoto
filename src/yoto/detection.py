@@ -238,12 +238,66 @@ def _enhance_and_detect(
     list[dict[str, Any]]
         Raw tag detections from the AprilTag library.
     """
-    sharp = unsharp_mask(
-        composite_gray,
-        kernel_size=apriltag_params["kernel_size"],
-        sigma=apriltag_params["sigma"],
-        amount=apriltag_params["amount"],
-    )
+    img = composite_gray
+
+    # Optional pre-stages (no-ops unless the preset enables them)
+    if apriltag_params.get("invert", False):
+        from yoto.image_processing import invert as _invert
+
+        img = _invert(img)
+
+    upscale_factor = float(apriltag_params.get("upscale", 1.0))
+    if upscale_factor != 1.0:
+        from yoto.image_processing import upscale as _upscale
+
+        img = _upscale(
+            img,
+            factor=upscale_factor,
+            interp=apriltag_params.get("upscale_interp", "lanczos"),
+        )
+
+    tone = apriltag_params.get("tone_map", "none")
+    if tone and tone != "none":
+        from yoto.image_processing import tone_map as _tone_map
+
+        img = _tone_map(img, method=tone)
+
+    if apriltag_params.get("use_gamma", False):
+        from yoto.image_processing import gamma_correct
+
+        img = gamma_correct(img, gamma=float(apriltag_params.get("gamma", 1.0)))
+
+    if apriltag_params.get("use_median_blur", False):
+        k = int(apriltag_params.get("median_kernel", 3))
+        if k % 2 == 0:
+            k += 1
+        img = cv2.medianBlur(img, k)
+
+    if apriltag_params.get("use_bilateral", False):
+        img = cv2.bilateralFilter(
+            img,
+            d=int(apriltag_params.get("bilateral_d", 5)),
+            sigmaColor=float(apriltag_params.get("bilateral_sigma_color", 50.0)),
+            sigmaSpace=float(apriltag_params.get("bilateral_sigma_space", 50.0)),
+        )
+
+    if apriltag_params.get("use_wiener", False):
+        raise NotImplementedError(
+            "use_wiener is not yet implemented in yoto.image_processing"
+        )
+
+    if apriltag_params.get("use_unsharp", True):
+        ks = apriltag_params["kernel_size"]
+        if isinstance(ks, int):
+            ks = (ks, ks)
+        sharp = unsharp_mask(
+            img,
+            kernel_size=ks,
+            sigma=apriltag_params["sigma"],
+            amount=apriltag_params["amount"],
+        )
+    else:
+        sharp = img
 
     contrast_method = apriltag_params.get("contrast_method", "simple")
     if contrast_method == "cv2":
@@ -258,6 +312,15 @@ def _enhance_and_detect(
         )
 
     tags: list[dict[str, Any]] = detector.detect(enhanced)
+
+    # If we upscaled the composite, tag coordinates are in upscaled space.
+    # Scale them back so _reproject_tags can index the original crops.
+    if upscale_factor != 1.0:
+        for tag in tags:
+            cx, cy = tag["center"]
+            tag["center"] = (cx / upscale_factor, cy / upscale_factor)
+            tag["lb-rb-rt-lt"] = tag["lb-rb-rt-lt"] / upscale_factor
+
     return tags
 
 
@@ -758,6 +821,7 @@ def run_detection_simple(
     pad_pixels: int = DEFAULT_PAD_PIXELS,
     num_frames: int | None = None,
     apriltag_params: dict[str, Any] | None = None,
+    preset: str | None = None,
 ) -> pd.DataFrame:
     """Run the simple (portable) YOLO + AprilTag detection pipeline.
 
@@ -799,6 +863,10 @@ def run_detection_simple(
     """
     if apriltag_params is None:
         apriltag_params = _build_apriltag_params_simple()
+    if preset is not None:
+        from yoto.apriltag_presets import load_preset, merge_preset
+
+        apriltag_params = merge_preset(apriltag_params, load_preset(preset))
 
     if num_frames is None:
         num_frames = _probe_frame_count(video_path)
@@ -890,6 +958,7 @@ def run_detection_fast(
     num_frames: int | None = None,
     debug: bool = False,
     apriltag_params: dict[str, Any] | None = None,
+    preset: str | None = None,
 ) -> pd.DataFrame:
     """Run the fast (NVDEC) YOLO + AprilTag detection pipeline.
 
@@ -938,6 +1007,10 @@ def run_detection_fast(
     """
     if apriltag_params is None:
         apriltag_params = _build_apriltag_params_fast()
+    if preset is not None:
+        from yoto.apriltag_presets import load_preset, merge_preset
+
+        apriltag_params = merge_preset(apriltag_params, load_preset(preset))
 
     if num_frames is None:
         num_frames = _probe_frame_count(video_path)
