@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
 
 [project]
@@ -66,7 +66,11 @@ Repository = "https://github.com/Social-Evolution-and-Behavior/yoto"
 Issues = "https://github.com/Social-Evolution-and-Behavior/yoto/issues"
 
 [tool.hatch.version]
-path = "src/yoto/__init__.py"
+source = "vcs"
+fallback-version = "0.9.1"
+
+[tool.hatch.build.hooks.vcs]
+version-file = "src/yoto/_version.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/yoto"]

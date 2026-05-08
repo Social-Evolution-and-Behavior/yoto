@@ -37,7 +37,9 @@ class TestCLI:
                 main()
         assert exc_info.value.code == 0
         captured = capsys.readouterr()
-        assert "0.1.0" in captured.out
+        from yoto import __version__
+
+        assert __version__ in captured.out
 
     def test_detect_subcommand_requires_video(self) -> None:
         with pytest.raises(SystemExit):

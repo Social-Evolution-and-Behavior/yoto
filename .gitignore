@@ -1,5 +1,6 @@
 # Python
 __pycache__/
+src/yoto/_version.py
 *.py[cod]
 *$py.class
 *.egg-info/
