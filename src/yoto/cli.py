@@ -234,10 +234,12 @@ def _add_detect_parser(subparsers: argparse._SubParsersAction) -> None:
         default=None,
         help="Output directory (default: same as video)",
     )
+    from yoto.detection import DEFAULT_WEIGHTS
+
     p.add_argument(
         "--yoloweights",
-        default="detect14.engine",
-        help="Path to YOLO weights (default: detect14.engine)",
+        default=DEFAULT_WEIGHTS,
+        help=f"Path to YOLO weights (default: {DEFAULT_WEIGHTS})",
     )
     p.add_argument(
         "--dataname",
@@ -849,7 +851,30 @@ def _add_clean_parser(subparsers: argparse._SubParsersAction) -> None:
         help="When input is a recording directory, clean only the pickle "
         "for the video at this 0-based index in the resolved video list",
     )
+    p.add_argument(
+        "--csv",
+        action="store_true",
+        help="Also write CSV copies alongside the pickles: a "
+        "<stem>_clean.csv next to each cleaned pickle, and a "
+        "<stem>.csv next to the input raw pickle.",
+    )
     p.set_defaults(func=_run_clean)
+
+
+def _write_csv(df: pd.DataFrame, path: str) -> None:
+    """Write *df* to CSV with a flattened single-row header.
+
+    Drops the per-detection ``corners`` column (each cell is a 4x2
+    ndarray that bloats the CSV and dominates write time). The pickle
+    keeps it.
+    """
+    keep = [c for c in df.columns if not (isinstance(c, tuple) and c[1] == "corners")]
+    flat = df[keep].reset_index()
+    flat.columns = [
+        "_".join(str(p) for p in c if p != "") if isinstance(c, tuple) else str(c)
+        for c in flat.columns
+    ]
+    flat.to_csv(path, index=False)
 
 
 def _clean_one_pickle(
@@ -858,6 +883,7 @@ def _clean_one_pickle(
     min_detections: int,
     interp_limit: int,
     max_jump: float,
+    write_csv: bool = False,
 ) -> tuple[str, str | None]:
     """Clean a single pickle. Returns ``(pkl_path, None)`` on success,
     or ``(pkl_path, error_message)`` on failure."""
@@ -867,6 +893,11 @@ def _clean_one_pickle(
 
     try:
         frame_data = pd.read_pickle(pkl_path)
+        # Write the raw CSV *before* clean_tracking_data, which mutates the
+        # input frame in place.
+        if write_csv:
+            raw_csv = os.path.splitext(pkl_path)[0] + ".csv"
+            _write_csv(frame_data, raw_csv)
         cleaned, _id_list, metrics = clean_tracking_data(
             frame_data,
             min_detections=min_detections,
@@ -882,10 +913,16 @@ def _clean_one_pickle(
             output_path = os.path.join(clean_dir, f"{stem}_clean.pkl")
         cleaned.to_pickle(output_path)
         print(f"Cleaned: {output_path}")
+        if write_csv:
+            clean_csv = os.path.splitext(output_path)[0] + ".csv"
+            _write_csv(cleaned, clean_csv)
+            print(f"  CSV:   {raw_csv}")
+            print(f"  CSV:   {clean_csv}")
         print(
             f"  detections={metrics['total_detections']}"
-            f"/{metrics['total_samples']} | "
-            f"errors={metrics['original_bad_count']} "
+            f"/{metrics['total_samples']} "
+            f"({100.0 * metrics['total_detections'] / metrics['total_samples']:.2f}%)"
+            f" | errors={metrics['original_bad_count']} "
             f"({metrics['error_pct']:.2f}%) | "
             f"filled={metrics['filled_count']}/{metrics['total_gaps']} gaps "
             f"({metrics['filled_pct_of_gaps']:.2f}% recovered)"
@@ -949,6 +986,7 @@ def _run_clean(args: argparse.Namespace) -> None:
             min_detections=args.min_detections,
             interp_limit=args.interp_limit,
             max_jump=args.max_jump,
+            write_csv=args.csv,
         )
         if result[1] is not None:
             logging.getLogger(__name__).error(
@@ -1313,6 +1351,7 @@ def main() -> None:
         parser.print_help()
         sys.exit(1)
 
+    print(f"yoto {_get_version()} — {args.command}")
     args.func(args)
 
 

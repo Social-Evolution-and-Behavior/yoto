@@ -128,6 +128,11 @@ mkdocs build               # static site under ./site/
 - ffmpeg — built with NVENC encoders (`hevc_nvenc`, `h264_nvenc`) and `-hwaccel cuda` for the GPU render fast path; `libx264` + OpenCV decode are used as automatic fallbacks
 - [AprilTag](https://github.com/Social-Evolution-and-Behavior/apriltag) (LSEB fork)
 
+## TODO
+
+- Implement a pipeline to semi-automatically retrain the YOLO model and AprilTag presets
+- Document the API for data analysis
+
 ## License
 
 [MIT](LICENSE)

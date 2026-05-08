@@ -105,11 +105,15 @@ def _open_ffmpeg_writer(
         "-vsync",
         "cfr",
     ]
+    from yoto import __version__
+
     compat = [
         "-g",
         str(keyframe_interval),
         "-movflags",
         "+faststart",
+        "-metadata",
+        f"comment=yoto={__version__}",
     ]
     hevc_nvenc = (
         "hevc_nvenc (GPU)",

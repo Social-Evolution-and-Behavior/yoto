@@ -8,7 +8,6 @@ quality metrics.
 
 from __future__ import annotations
 
-import logging
 from typing import Any
 
 import numpy as np
@@ -26,9 +25,6 @@ from yoto.constants import (
     DEFAULT_MAX_JUMP_DISTANCE,
     MIN_DETECTIONS_PER_ID,
 )
-
-logger = logging.getLogger(__name__)
-
 
 # ---------------------------------------------------------------------------
 # Quality metrics type
@@ -218,6 +214,7 @@ def clean_tracking_data(
     >>> cleaned, ids, metrics = clean_tracking_data(df)  # doctest: +SKIP
     >>> print(f"Error rate: {metrics['error_pct']:.2f}%")  # doctest: +SKIP
     """
+    input_attrs = dict(frame_data.attrs)
     id_list = np.unique(frame_data.columns.get_level_values(0))
 
     # --- Step 1: remove low-count IDs ---
@@ -324,21 +321,18 @@ def clean_tracking_data(
         ),
     }
 
-    logger.info(
-        "Cleaning complete: detections=%d/%d (%.2f%%), errors=%d (%.2f%%), "
-        "filled=%d/%d gaps (%.2f%% recovered)",
-        metrics["total_detections"],
-        metrics["total_samples"],
-        (
-            metrics["total_detections"] / metrics["total_samples"] * 100
-            if metrics["total_samples"]
-            else 0
-        ),
-        metrics["original_bad_count"],
-        metrics["error_pct"],
-        metrics["filled_count"],
-        metrics["total_gaps"],
-        metrics["filled_pct_of_gaps"],
-    )
+    from datetime import datetime, timezone
+
+    from yoto import __version__
+
+    # Restore the detect-stage provenance (lost by .drop/.join inside this
+    # function) and overlay clean-stage fields on top.
+    frame_data.attrs.update(input_attrs)
+    detect_version = input_attrs.get("yoto_version")
+    if detect_version is not None:
+        frame_data.attrs["yoto_detect_version"] = detect_version
+    frame_data.attrs["yoto_version"] = __version__
+    frame_data.attrs["yoto_stage"] = "clean"
+    frame_data.attrs["yoto_cleaned_utc"] = datetime.now(timezone.utc).isoformat()
 
     return frame_data, id_list, metrics

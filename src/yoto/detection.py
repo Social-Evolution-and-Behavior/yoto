@@ -802,6 +802,31 @@ def _pynvdec_predict(
 # ---------------------------------------------------------------------------
 
 
+def _stamp_attrs(
+    df: pd.DataFrame,
+    video_path: str,
+    pipeline: str,
+    extra: dict[str, Any] | None = None,
+) -> None:
+    """Embed yoto provenance into ``df.attrs`` (preserved through pickle)."""
+    from datetime import datetime, timezone
+
+    from yoto import __version__
+
+    df.attrs["yoto_version"] = __version__
+    df.attrs["yoto_stage"] = "detect"
+    df.attrs["yoto_pipeline"] = pipeline
+    df.attrs["yoto_video"] = os.path.abspath(video_path)
+    df.attrs["yoto_created_utc"] = datetime.now(timezone.utc).isoformat()
+    if extra:
+        df.attrs.update(extra)
+
+
+DEFAULT_WEIGHTS = os.path.normpath(
+    os.path.join(os.path.dirname(__file__), "..", "..", "models", "detect14.engine")
+)
+
+
 def _probe_frame_count(video_path: str, fallback: int = 18000) -> int:
     """Return the video's frame count via OpenCV, or *fallback* on error."""
     cap = cv2.VideoCapture(video_path)
@@ -815,7 +840,7 @@ def _probe_frame_count(video_path: str, fallback: int = 18000) -> int:
 def run_detection_simple(
     video_path: str,
     output_path: str | None = None,
-    yolo_weights: str = "detect14.engine",
+    yolo_weights: str = DEFAULT_WEIGHTS,
     data_suffix: str = "_apriltagDetect14",
     conf_threshold: float = DEFAULT_CONF_THRESHOLD,
     pad_pixels: int = DEFAULT_PAD_PIXELS,
@@ -936,6 +961,12 @@ def run_detection_simple(
     df = pd.DataFrame(results_tag)
     df.columns = pd.MultiIndex.from_tuples(df.columns)
     df = df.set_index(COL_FRAME)
+    _stamp_attrs(
+        df,
+        video_path,
+        pipeline="simple",
+        extra={"yoto_yolo_weights": yolo_weights, "yoto_preset": preset},
+    )
     df.to_pickle(out_pkl)
 
     total_time = time.time() - start_time
@@ -948,7 +979,7 @@ def run_detection_simple(
 def run_detection_fast(
     video_path: str,
     output_path: str | None = None,
-    yolo_weights: str = "detect14.engine",
+    yolo_weights: str = DEFAULT_WEIGHTS,
     data_suffix: str = "_apriltagDetect14",
     conf_threshold: float = DEFAULT_CONF_THRESHOLD,
     iou_threshold: float = DEFAULT_IOU_THRESHOLD,
@@ -1115,6 +1146,12 @@ def run_detection_fast(
     df = pd.DataFrame(results_tag)
     df.columns = pd.MultiIndex.from_tuples(df.columns)
     df = df.set_index(COL_FRAME)
+    _stamp_attrs(
+        df,
+        video_path,
+        pipeline="fast",
+        extra={"yoto_yolo_weights": yolo_weights, "yoto_preset": preset},
+    )
     df.to_pickle(out_pkl)
 
     total_time = time.time() - start_time

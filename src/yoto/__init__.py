@@ -5,7 +5,7 @@ YOLO object detection, with tools for data cleaning, interpolation, and
 video overlay visualization.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.8.1"
 
 from yoto.detection import run_detection_simple, run_detection_fast
 from yoto.cleaning import clean_tracking_data
