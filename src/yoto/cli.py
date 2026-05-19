@@ -84,11 +84,14 @@ def _resolve_video_paths(path: str) -> list[str]:
     if not os.path.isdir(path):
         return [path]  # let downstream raise a clear error
 
-    # Look for video files directly inside the directory
+    # Look for video files directly inside the directory.  Hidden files
+    # (leading '.') are skipped — this filters out macOS AppleDouble
+    # stubs like ``._000002.mp4`` that crash the NVDEC decoder.
     direct_videos = sorted(
         os.path.join(path, f)
         for f in os.listdir(path)
-        if os.path.isfile(os.path.join(path, f))
+        if not f.startswith(".")
+        and os.path.isfile(os.path.join(path, f))
         and os.path.splitext(f)[1].lower() in VIDEO_EXTENSIONS
     )
     if direct_videos:
@@ -97,6 +100,8 @@ def _resolve_video_paths(path: str) -> list[str]:
     # Otherwise look one level deeper (sub-directories of recordings)
     videos: list[str] = []
     for entry in sorted(os.listdir(path)):
+        if entry.startswith("."):
+            continue
         subdir = os.path.join(path, entry)
         if not os.path.isdir(subdir):
             continue
@@ -104,7 +109,8 @@ def _resolve_video_paths(path: str) -> list[str]:
             sorted(
                 os.path.join(subdir, f)
                 for f in os.listdir(subdir)
-                if os.path.isfile(os.path.join(subdir, f))
+                if not f.startswith(".")
+                and os.path.isfile(os.path.join(subdir, f))
                 and os.path.splitext(f)[1].lower() in VIDEO_EXTENSIONS
             )
         )
@@ -121,7 +127,11 @@ def _resolve_pickle_paths(path: str, data_suffix: str = "") -> list[str]:
     """
 
     def _is_raw(f: str) -> bool:
-        return f.endswith(".pkl") and not f.endswith("_clean.pkl")
+        return (
+            not f.startswith(".")
+            and f.endswith(".pkl")
+            and not f.endswith("_clean.pkl")
+        )
 
     def _pickles_in(d: str) -> list[str]:
         return sorted(
