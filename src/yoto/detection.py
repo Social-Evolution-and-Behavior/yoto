@@ -823,7 +823,7 @@ def _stamp_attrs(
 
 
 DEFAULT_WEIGHTS = os.path.normpath(
-    os.path.join(os.path.dirname(__file__), "..", "..", "models", "detect14.engine")
+    os.path.join(os.path.dirname(__file__), "..", "..", "models", "detect14.pt")
 )
 
 
