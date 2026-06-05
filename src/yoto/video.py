@@ -25,8 +25,12 @@ from tqdm import tqdm
 
 from yoto._types import FloatArray
 from yoto.constants import (
+    ASS_TYPE_ORIGINAL,
+    ASS_TYPE_YOLO_INFERRED,
+    COL_ASS_TYPE,
     COL_CENTER_X,
     COL_CENTER_Y,
+    COL_CORNERS,
     DEFAULT_TRAIL_LENGTH,
     DEFAULT_TRAIL_SKIP,
     TAG_COLOR_SEED,
@@ -439,6 +443,10 @@ def render_overlay_video(
     draw_trails: bool = True,
     text_scale_factor: float = 1.0,
     codec: str = "auto",
+    quads_data: pd.DataFrame | None = None,
+    undecoded_data: pd.DataFrame | None = None,
+    debug: bool = False,
+    yolo_data: pd.DataFrame | None = None,
 ) -> str:
     """Render a video with tracking overlays via a 3-thread pipeline.
 
@@ -507,6 +515,114 @@ def render_overlay_video(
 
     rng = np.random.default_rng(TAG_COLOR_SEED)
     tag_colors = [tuple(int(c) for c in rng.integers(0, 255, 3)) for _ in id_list]
+
+    # Quads: group long-format DataFrame into {frame_idx: [4x2 ndarray, ...]}
+    # so the draw loop can look up by frame in O(1).  Scale corners to
+    # output resolution at extraction time.
+    quads_by_frame: dict[int, list[np.ndarray[Any, np.dtype[np.int32]]]] = {}
+    if quads_data is not None and len(quads_data):
+        for fn, corners in zip(
+            quads_data.index.to_numpy(), quads_data["corners"].to_numpy()
+        ):
+            arr = np.asarray(corners, dtype=np.float32)
+            if do_resize:
+                arr = arr * scale
+            quads_by_frame.setdefault(int(fn), []).append(arr.astype(np.int32))
+
+    # Undecoded YOLO boxes: {frame_idx: [(x1, y1, x2, y2), ...]}
+    undecoded_by_frame: dict[int, list[tuple[int, int, int, int]]] = {}
+    if undecoded_data is not None and len(undecoded_data):
+        xs1 = undecoded_data["box_x1"].to_numpy()
+        ys1 = undecoded_data["box_y1"].to_numpy()
+        xs2 = undecoded_data["box_x2"].to_numpy()
+        ys2 = undecoded_data["box_y2"].to_numpy()
+        fns = undecoded_data.index.to_numpy()
+        if do_resize:
+            xs1, ys1, xs2, ys2 = xs1 * scale, ys1 * scale, xs2 * scale, ys2 * scale
+        for fn, x1, y1, x2, y2 in zip(fns, xs1, ys1, xs2, ys2):
+            undecoded_by_frame.setdefault(int(fn), []).append(
+                (int(x1), int(y1), int(x2), int(y2))
+            )
+
+    # ---- Debug overlay: per-frame YOLO boxes + decoded-quad polygons ----
+    # Colour key:
+    #   green  = YOLO box that AprilTag decoded (ass_type=ORIGINAL)
+    #   yellow = YOLO box that didn't decode but Phase 2 matched to a tag
+    #            (ass_type=YOLO_INFERRED at the same center)
+    #   red    = YOLO box that didn't decode and Phase 2 didn't recover it
+    DebugBox = tuple[int, int, int, int, tuple[int, int, int]]
+    debug_boxes_by_frame: dict[int, list[DebugBox]] = {}
+    debug_quads_by_frame: dict[int, list[np.ndarray[Any, np.dtype[np.int32]]]] = {}
+    if debug:
+        # Set of (frame, rounded center) for YOLO_INFERRED cells.  Phase 2
+        # writes the YOLO box's exact center as the tag position, so a
+        # 1-px tolerance is enough to recognise the same point.
+        inferred_centers: set[tuple[int, int, int]] = set()
+        if COL_ASS_TYPE in frame_data.columns.get_level_values(1):
+            for tag_id in id_list:
+                ass = frame_data[(tag_id, COL_ASS_TYPE)]
+                mask = ass == ASS_TYPE_YOLO_INFERRED
+                if not mask.any():
+                    continue
+                xs = frame_data.loc[mask, (tag_id, COL_CENTER_X)].to_numpy()
+                ys = frame_data.loc[mask, (tag_id, COL_CENTER_Y)].to_numpy()
+                frames = ass.index[mask].to_numpy()
+                for fn, cx_, cy_ in zip(frames, xs, ys):
+                    inferred_centers.add((int(fn), int(round(cx_)), int(round(cy_))))
+
+        if yolo_data is not None and len(yolo_data):
+            xs1 = yolo_data["box_x1"].to_numpy()
+            ys1 = yolo_data["box_y1"].to_numpy()
+            xs2 = yolo_data["box_x2"].to_numpy()
+            ys2 = yolo_data["box_y2"].to_numpy()
+            cxs = yolo_data[COL_CENTER_X].to_numpy()
+            cys = yolo_data[COL_CENTER_Y].to_numpy()
+            decoded_flags = yolo_data["decoded"].to_numpy()
+            fns = yolo_data.index.to_numpy()
+            if do_resize:
+                xs1, ys1 = xs1 * scale, ys1 * scale
+                xs2, ys2 = xs2 * scale, ys2 * scale
+                cxs, cys = cxs * scale, cys * scale
+            for fn, x1, y1, x2, y2, cxv, cyv, dec in zip(
+                fns, xs1, ys1, xs2, ys2, cxs, cys, decoded_flags
+            ):
+                if dec:
+                    color = (0, 255, 0)  # green
+                elif (int(fn), int(round(cxv)), int(round(cyv))) in inferred_centers:
+                    color = (0, 255, 255)  # yellow
+                else:
+                    color = (0, 0, 255)  # red
+                debug_boxes_by_frame.setdefault(int(fn), []).append(
+                    (int(x1), int(y1), int(x2), int(y2), color)
+                )
+
+        # AprilTag decoded quads for ORIGINAL detections (from the
+        # cleaned pickle's corners column).  Each cell holds a 4x2 ndarray.
+        if COL_CORNERS in frame_data.columns.get_level_values(1):
+            for tag_id in id_list:
+                if (tag_id, COL_CORNERS) not in frame_data.columns:
+                    continue
+                col = frame_data[(tag_id, COL_CORNERS)]
+                ass = (
+                    frame_data[(tag_id, COL_ASS_TYPE)]
+                    if (tag_id, COL_ASS_TYPE) in frame_data.columns
+                    else None
+                )
+                for fn, corners in zip(col.index.to_numpy(), col.to_numpy()):
+                    if corners is None or (
+                        isinstance(corners, float) and np.isnan(corners)
+                    ):
+                        continue
+                    if ass is not None and ass.loc[fn] != ASS_TYPE_ORIGINAL:
+                        continue
+                    arr = np.asarray(corners, dtype=np.float32)
+                    if arr.shape != (4, 2):
+                        continue
+                    if do_resize:
+                        arr = arr * scale
+                    debug_quads_by_frame.setdefault(int(fn), []).append(
+                        arr.astype(np.int32)
+                    )
 
     thickness = np.array([1] * 5 + [1] * 5 + [2] * 10 + [3] * 30, dtype=np.int32)
 
@@ -632,6 +748,56 @@ def render_overlay_video(
                                     color=color,
                                     thickness=int(th_val),
                                 )
+
+                # Undecoded raw quads (white closed polygons, thin) so a
+                # gap with a candidate quad nearby is visually obvious.
+                if quads_by_frame:
+                    for quad in quads_by_frame.get(fn, ()):
+                        cv2.polylines(
+                            frame,
+                            [quad.reshape(-1, 1, 2)],
+                            isClosed=True,
+                            color=(255, 255, 255),
+                            thickness=1,
+                            lineType=cv2.LINE_AA,
+                        )
+
+                # Undecoded YOLO boxes (yellow rectangles): coarser than
+                # quads but more reliable -- one per YOLO detection that
+                # AprilTag failed to decode.
+                if undecoded_by_frame:
+                    for x1, y1, x2, y2 in undecoded_by_frame.get(fn, ()):
+                        cv2.rectangle(
+                            frame,
+                            (x1, y1),
+                            (x2, y2),
+                            color=(0, 255, 255),
+                            thickness=1,
+                            lineType=cv2.LINE_AA,
+                        )
+
+                # Debug overlay: every YOLO box coloured by its post-Phase-2
+                # state, plus decoded AprilTag quads for ORIGINAL tags.
+                if debug:
+                    for box in debug_boxes_by_frame.get(fn, ()):
+                        x1, y1, x2, y2, color = box
+                        cv2.rectangle(
+                            frame,
+                            (x1, y1),
+                            (x2, y2),
+                            color=color,
+                            thickness=1,
+                            lineType=cv2.LINE_AA,
+                        )
+                    for quad in debug_quads_by_frame.get(fn, ()):
+                        cv2.polylines(
+                            frame,
+                            [quad.reshape(-1, 1, 2)],
+                            isClosed=True,
+                            color=(0, 255, 0),
+                            thickness=1,
+                            lineType=cv2.LINE_AA,
+                        )
 
                 n_visible = int(nb_ids_per_frame[fn]) if fn <= max_frame else 0
                 cv2.putText(

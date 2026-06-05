@@ -13,11 +13,17 @@ from __future__ import annotations
 #: Minimum confidence score for a YOLO bounding-box to be kept.
 DEFAULT_CONF_THRESHOLD: float = 0.1
 
-#: Pixels added around each detected bounding box before cropping.
-DEFAULT_PAD_PIXELS: int = 10
+#: Per-axis padding ratio added around each YOLO bounding box before
+#: cropping for AprilTag decoding.  Each side grows by
+#: ``pad_ratio * box_dimension`` (independently in x and y), so the
+#: padding scales with the apparent tag size — useful when the camera
+#: height changes between recordings.  Default ``0.34`` matches the
+#: empirical sweet spot for the CleanSlab/IR dataset where the median
+#: box dimension is ~35 px and 12 px each side decodes best.
+DEFAULT_PAD_RATIO: float = 0.34
 
 #: IoU threshold for non-maximum suppression.
-DEFAULT_IOU_THRESHOLD: float = 0.7
+DEFAULT_IOU_THRESHOLD: float = 0.4
 
 #: YOLO input resolution (square side length).
 DEFAULT_TARGET_SIZE: int = 1024
@@ -27,6 +33,16 @@ DEFAULT_MAX_DETECTIONS: int = 300
 
 #: Default batch size for the fast (NVDEC) pipeline.
 DEFAULT_BATCH_SIZE: int = 2
+
+#: Maximum allowed distance between an AprilTag decode's center and the
+#: center of its source YOLO box, expressed as a fraction of the box's
+#: shorter side: ``threshold = max_offset_ratio * min(box_w, box_h)``.
+#: Tags decoded outside that radius are dropped — almost always
+#: AprilTag finding a quad in the padding region rather than the actual
+#: tag.  ``0.6`` permits a tag center to fall in the central 1.2 *
+#: min(box_w, box_h) square around the box center, generous enough that
+#: it doesn't fire on slightly off-center genuine decodes.
+DEFAULT_MAX_TAG_OFFSET_RATIO: float = 0.6
 
 # ---------------------------------------------------------------------------
 # AprilTag detection defaults
@@ -113,6 +129,34 @@ MIN_DETECTIONS_PER_ID: int = 100
 #: Maximum gap length (frames) that linear interpolation will bridge.
 DEFAULT_INTERPOLATION_LIMIT: int = 5
 
+#: Maximum gap length (frames) that the YOLO-fill pass will bridge.
+#: ``0`` (default) disables the cap — gap length is controlled instead
+#: by ``DEFAULT_MAX_CONSECUTIVE_MISSES`` so chains die on their own when
+#: the evidence runs out.  Set to a positive integer to add a hard cap.
+DEFAULT_YOLO_FILL_LIMIT: int = 0
+
+#: Percentile of the "good track" frame-to-frame distance distribution
+#: used as the per-frame snap threshold for YOLO fill.  A high value
+#: tolerates the rare fast movements without admitting unrealistic jumps.
+DEFAULT_GOOD_TRACK_PERCENTILE: float = 99.0
+
+#: Multiplier applied to ``snap_threshold`` to obtain the maximum
+#: distance between a YOLO box and the linear-interp prior for the
+#: YOLO-fill snap to be accepted.  Constant — does NOT scale with gap
+#: age, so long gaps stay tightly bounded.
+DEFAULT_SNAP_MULTIPLIER: float = 2.0
+
+#: Maximum number of consecutive frames inside a chain where no YOLO
+#: box passes the snap test before the chain is broken (anchor cleared).
+#: Lets short stretches of bad YOLO detection survive without letting
+#: the chain drift off when the tag really has left the scene.
+DEFAULT_MAX_CONSECUTIVE_MISSES: int = 10
+
+#: When re-chaining after a prune pass, restrict candidates to only the
+#: tags whose YOLO fills were pruned (``True``), rather than letting all
+#: tags compete for the freed boxes (``False``, default).
+DEFAULT_RECHAIN_AFFECTED_ONLY: bool = False
+
 #: Maximum distance (pixels) between consecutive frames before a
 #: detection is considered a tracking jump and deleted.
 DEFAULT_MAX_JUMP_DISTANCE: float = 100.0
@@ -145,6 +189,10 @@ COL_FRAME: str = "frame"
 COL_CENTER_X: str = "center_x"
 COL_CENTER_Y: str = "center_y"
 COL_CORNERS: str = "corners"
+COL_BOX_X1: str = "box_x1"
+COL_BOX_Y1: str = "box_y1"
+COL_BOX_X2: str = "box_x2"
+COL_BOX_Y2: str = "box_y2"
 COL_ASS_TYPE: str = "ass_type"
 COL_DISTANCE: str = "distance"
 
@@ -160,3 +208,6 @@ ASS_TYPE_ORIGINAL: int = 1
 
 #: Value filled by short-range linear interpolation.
 ASS_TYPE_INTERPOLATED: int = 2
+
+#: Value inferred from an undecoded YOLO box in the same frame.
+ASS_TYPE_YOLO_INFERRED: int = 3

@@ -68,6 +68,18 @@ def _normalize_dataname(name: str) -> str:
     return name if name.startswith("_") else "_" + name
 
 
+def _str_to_bool(s: str) -> bool:
+    """argparse type converter — accepts ``True/False`` (any case),
+    plus ``1/0``, ``yes/no``, ``on/off``.  Raises a friendly error
+    otherwise.  Used for ``--flag True|False`` style toggles so the
+    CLI presents all booleans uniformly."""
+    if s.lower() in ("true", "1", "yes", "on"):
+        return True
+    if s.lower() in ("false", "0", "no", "off"):
+        return False
+    raise argparse.ArgumentTypeError(f"Boolean value expected (True/False), got {s!r}")
+
+
 def _resolve_video_paths(path: str) -> list[str]:
     """Resolve *path* to a list of video file paths.
 
@@ -127,10 +139,14 @@ def _resolve_pickle_paths(path: str, data_suffix: str = "") -> list[str]:
     """
 
     def _is_raw(f: str) -> bool:
+        # Exclude sidecars: <stem>_quads.pkl and <stem>_yolo.pkl are
+        # produced by `yoto detect` and are not cleanable input.
         return (
             not f.startswith(".")
             and f.endswith(".pkl")
             and not f.endswith("_clean.pkl")
+            and not f.endswith("_quads.pkl")
+            and not f.endswith("_yolo.pkl")
         )
 
     def _pickles_in(d: str) -> list[str]:
@@ -257,9 +273,15 @@ def _add_detect_parser(subparsers: argparse._SubParsersAction) -> None:
         help="Suffix for output data file",
     )
     p.add_argument(
-        "--fast",
-        action="store_true",
-        help="Use the fast NVDEC pipeline (requires PyNvVideoCodec)",
+        "--use-nvdec",
+        type=_str_to_bool,
+        default=True,
+        metavar="BOOL",
+        help="Use the NVDEC + GPU-resident preprocessing pipeline for "
+        "maximum throughput (default: True; requires PyNvVideoCodec and "
+        "an NVIDIA GPU with NVDEC support).  Set to False to fall back "
+        "to the portable Ultralytics streaming pipeline, which works on "
+        "any CUDA-capable machine but is ~30 percent slower.",
     )
     p.add_argument(
         "--parallel",
@@ -286,6 +308,91 @@ def _add_detect_parser(subparsers: argparse._SubParsersAction) -> None:
         "file (e.g. an Optuna best_params_*.json). Defaults stay untouched "
         "when omitted.",
     )
+    from yoto.constants import (
+        DEFAULT_CONF_THRESHOLD,
+        DEFAULT_IOU_THRESHOLD,
+        DEFAULT_MAX_TAG_OFFSET_RATIO,
+        DEFAULT_PAD_RATIO,
+    )
+
+    p.add_argument(
+        "--conf",
+        type=float,
+        default=DEFAULT_CONF_THRESHOLD,
+        metavar="FLOAT",
+        help=f"YOLO confidence threshold (default: {DEFAULT_CONF_THRESHOLD})",
+    )
+    p.add_argument(
+        "--pad-ratio",
+        type=float,
+        default=DEFAULT_PAD_RATIO,
+        metavar="FLOAT",
+        help=f"Per-axis padding ratio added around each YOLO box before "
+        f"cropping for AprilTag decoding (default: {DEFAULT_PAD_RATIO}). "
+        "Each side grows by ratio * box_dim, so padding scales with "
+        "apparent tag size — the same value works across camera heights. "
+        "Larger values give the decoder more context but slow it down and "
+        "risk neighbouring tags landing in the same crop.",
+    )
+    p.add_argument(
+        "--max-tag-offset-ratio",
+        type=float,
+        default=DEFAULT_MAX_TAG_OFFSET_RATIO,
+        metavar="FLOAT",
+        help=f"Drop AprilTag decodes whose center is farther from the source "
+        f"YOLO box center than `ratio * min(box_w, box_h)` "
+        f"(default: {DEFAULT_MAX_TAG_OFFSET_RATIO}). Catches misdecodes "
+        "where AprilTag found a quad in the padding region rather than the "
+        "actual tag. The dropped box stays in the undecoded pool for "
+        "yoto clean to pick up via YOLO-fill.",
+    )
+    p.add_argument(
+        "--tag-offset-filter",
+        type=_str_to_bool,
+        default=True,
+        metavar="BOOL",
+        help="Apply the box-center offset filter that drops AprilTag "
+        "decodes farther than `--max-tag-offset-ratio * min(box_w, "
+        "box_h)` from their source YOLO box center (default: True). "
+        "Set to False to accept every decode regardless of distance — "
+        "useful for diagnostics, equivalent to "
+        "`--max-tag-offset-ratio inf`.",
+    )
+    p.add_argument(
+        "--iou",
+        type=float,
+        default=DEFAULT_IOU_THRESHOLD,
+        metavar="FLOAT",
+        help=f"YOLO NMS IoU threshold (default: {DEFAULT_IOU_THRESHOLD}). "
+        "Lower = more aggressive duplicate suppression.",
+    )
+    p.add_argument(
+        "--nms-mode",
+        choices=("suppress", "fuse"),
+        default="suppress",
+        help="How to handle overlapping YOLO boxes. 'suppress' (default) "
+        "uses standard NMS (drop lower-conf overlapping boxes). 'fuse' "
+        "replaces each overlap cluster with the union of its boxes — "
+        "useful when the highest-conf box framing isn't always the one "
+        "that decodes the AprilTag. Fast pipeline only.",
+    )
+    p.add_argument(
+        "--save-yolo",
+        type=_str_to_bool,
+        default=True,
+        metavar="BOOL",
+        help="Write the _yolo.pkl sidecar (default: True). Set False to skip "
+        "the GPU→CPU confidence transfer and reduce disk I/O — safe when "
+        "you will not use `yoto clean --yolo-fill True`.",
+    )
+    p.add_argument(
+        "--save-quads",
+        type=_str_to_bool,
+        default=False,
+        metavar="BOOL",
+        help="Write the _quads.pkl sidecar with raw AprilTag quads "
+        "(default: False). Only needed for `yoto render --quads`.",
+    )
     p.add_argument(
         "--debug",
         action="store_true",
@@ -296,22 +403,45 @@ def _add_detect_parser(subparsers: argparse._SubParsersAction) -> None:
 
 def _run_single_video(
     vpath: str,
-    fast: bool,
+    use_nvdec: bool,
     output_dir: str | None,
     yolo_weights: str,
     data_suffix: str,
     debug: bool,
     preset: str | None = None,
+    conf: float | None = None,
+    iou: float | None = None,
+    nms_mode: str = "suppress",
+    pad_ratio: float | None = None,
+    max_tag_offset_ratio: float | None = None,
+    save_yolo: bool = True,
+    save_quads: bool = False,
 ) -> tuple[str, str | None]:
     """Run detection on one video. Returns ``(vpath, None)`` on success,
     or ``(vpath, traceback_text)`` on failure."""
     import traceback
 
+    from yoto.constants import (
+        DEFAULT_CONF_THRESHOLD,
+        DEFAULT_IOU_THRESHOLD,
+        DEFAULT_MAX_TAG_OFFSET_RATIO,
+        DEFAULT_PAD_RATIO,
+    )
+
+    if conf is None:
+        conf = DEFAULT_CONF_THRESHOLD
+    if iou is None:
+        iou = DEFAULT_IOU_THRESHOLD
+    if pad_ratio is None:
+        pad_ratio = DEFAULT_PAD_RATIO
+    if max_tag_offset_ratio is None:
+        max_tag_offset_ratio = DEFAULT_MAX_TAG_OFFSET_RATIO
+
     if output_dir is None:
         output_dir = _tracking_layout(_recording_dir_for_video(vpath))["raw_data"]
 
     try:
-        if fast:
+        if use_nvdec:
             from yoto.detection import run_detection_fast
 
             run_detection_fast(
@@ -321,8 +451,21 @@ def _run_single_video(
                 data_suffix=data_suffix,
                 debug=debug,
                 preset=preset,
+                conf_threshold=conf,
+                iou_threshold=iou,
+                nms_mode=nms_mode,
+                pad_ratio=pad_ratio,
+                max_offset_ratio=max_tag_offset_ratio,
+                save_yolo=save_yolo,
+                save_quads=save_quads,
             )
         else:
+            if nms_mode != "suppress":
+                print(
+                    "WARNING: --nms-mode fuse is only implemented for the "
+                    "fast pipeline. The simple pipeline will use standard "
+                    "NMS via ultralytics."
+                )
             from yoto.detection import run_detection_simple
 
             run_detection_simple(
@@ -331,6 +474,12 @@ def _run_single_video(
                 yolo_weights=yolo_weights,
                 data_suffix=data_suffix,
                 preset=preset,
+                conf_threshold=conf,
+                iou_threshold=iou,
+                pad_ratio=pad_ratio,
+                max_offset_ratio=max_tag_offset_ratio,
+                save_yolo=save_yolo,
+                save_quads=save_quads,
             )
         return (vpath, None)
     except Exception:
@@ -347,12 +496,23 @@ def _build_worker_cmd(
         cmd.append(args.output_dir)
     cmd.extend(["--yoloweights", args.yoloweights])
     cmd.extend(["--dataname", args.dataname])
-    if args.fast:
-        cmd.append("--fast")
+    cmd.extend(["--use-nvdec", str(args.use_nvdec)])
     if args.debug:
         cmd.append("--debug")
     if getattr(args, "apriltag_preset", None):
         cmd.extend(["--apriltag-preset", args.apriltag_preset])
+    if getattr(args, "conf", None) is not None:
+        cmd.extend(["--conf", str(args.conf)])
+    if getattr(args, "iou", None) is not None:
+        cmd.extend(["--iou", str(args.iou)])
+    if getattr(args, "nms_mode", None):
+        cmd.extend(["--nms-mode", args.nms_mode])
+    if getattr(args, "pad_ratio", None) is not None:
+        cmd.extend(["--pad-ratio", str(args.pad_ratio)])
+    if getattr(args, "max_tag_offset_ratio", None) is not None:
+        cmd.extend(["--max-tag-offset-ratio", str(args.max_tag_offset_ratio)])
+    cmd.extend(["--save-yolo", str(args.save_yolo)])
+    cmd.extend(["--save-quads", str(args.save_quads)])
     return cmd
 
 
@@ -683,6 +843,12 @@ def _run_detect(args: argparse.Namespace) -> None:
     _configure_logging(args.debug)
     args.dataname = _normalize_dataname(args.dataname)
 
+    # --tag-offset-filter False == --max-tag-offset-ratio inf.  Collapse
+    # to a single value here so the rest of the dispatch logic (both
+    # sequential and the GNU-parallel worker template) handles one knob.
+    if not args.tag_offset_filter:
+        args.max_tag_offset_ratio = float("inf")
+
     video_paths = _resolve_video_paths(args.video)
     if not video_paths:
         print(f"No video files found in: {args.video}")
@@ -704,13 +870,14 @@ def _run_detect(args: argparse.Namespace) -> None:
         print("Error: --parallel must be >= 1")
         sys.exit(1)
 
-    if args.fast and args.parallel and args.parallel > 1:
+    if args.use_nvdec and args.parallel and args.parallel > 1:
         print(
-            f"WARNING: --fast with --parallel {args.parallel} runs multiple "
-            "NVDEC sessions on one GPU. The RTX A6000 has a limited number "
-            "of NVDEC engines (2–3); oversubscription may hurt throughput "
-            "and contend on VRAM. The simple pipeline parallelises more "
-            "cleanly at high worker counts."
+            f"WARNING: --use-nvdec True with --parallel {args.parallel} runs "
+            "multiple NVDEC sessions on one GPU. The RTX A6000 has a limited "
+            "number of NVDEC engines (2–3); oversubscription may hurt "
+            "throughput and contend on VRAM. The Ultralytics streaming "
+            "pipeline (--use-nvdec False) parallelises more cleanly at high "
+            "worker counts."
         )
 
     use_parallel = (
@@ -734,12 +901,18 @@ def _run_detect(args: argparse.Namespace) -> None:
             worker_tmpl.append(args.output_dir)
         worker_tmpl.extend(["--yoloweights", args.yoloweights])
         worker_tmpl.extend(["--dataname", args.dataname])
-        if args.fast:
-            worker_tmpl.append("--fast")
+        worker_tmpl.extend(["--use-nvdec", str(args.use_nvdec)])
         if args.debug:
             worker_tmpl.append("--debug")
         if args.apriltag_preset:
             worker_tmpl.extend(["--apriltag-preset", args.apriltag_preset])
+        worker_tmpl.extend(["--conf", str(args.conf)])
+        worker_tmpl.extend(["--iou", str(args.iou)])
+        worker_tmpl.extend(["--nms-mode", args.nms_mode])
+        worker_tmpl.extend(["--pad-ratio", str(args.pad_ratio)])
+        worker_tmpl.extend(["--max-tag-offset-ratio", str(args.max_tag_offset_ratio)])
+        worker_tmpl.extend(["--save-yolo", str(args.save_yolo)])
+        worker_tmpl.extend(["--save-quads", str(args.save_quads)])
         input_root = (
             args.video
             if os.path.isdir(args.video)
@@ -758,12 +931,19 @@ def _run_detect(args: argparse.Namespace) -> None:
                 print(f"\n[{idx}/{len(video_paths)}] {vpath}")
             result = _run_single_video(
                 vpath=vpath,
-                fast=args.fast,
+                use_nvdec=args.use_nvdec,
                 output_dir=args.output_dir,
                 yolo_weights=args.yoloweights,
                 data_suffix=args.dataname,
                 debug=args.debug,
                 preset=args.apriltag_preset,
+                conf=args.conf,
+                iou=args.iou,
+                nms_mode=args.nms_mode,
+                pad_ratio=args.pad_ratio,
+                max_tag_offset_ratio=args.max_tag_offset_ratio,
+                save_yolo=args.save_yolo,
+                save_quads=args.save_quads,
             )
             if result[1] is not None:
                 logging.getLogger(__name__).error(
@@ -868,6 +1048,68 @@ def _add_clean_parser(subparsers: argparse._SubParsersAction) -> None:
         "<stem>_clean.csv next to each cleaned pickle, and a "
         "<stem>.csv next to the input raw pickle.",
     )
+    from yoto.constants import (
+        DEFAULT_MAX_CONSECUTIVE_MISSES,
+        DEFAULT_SNAP_MULTIPLIER,
+        DEFAULT_YOLO_FILL_LIMIT,
+    )
+
+    p.add_argument(
+        "--yolo-fill",
+        type=_str_to_bool,
+        default=True,
+        metavar="BOOL",
+        help="Run the YOLO-fill pass that bridges gaps using the "
+        "undecoded YOLO boxes from <stem>_yolo.pkl (default: True). "
+        "Set to False to skip step 6 entirely and rely only on linear "
+        "interpolation.",
+    )
+    p.add_argument(
+        "--yolo-fill-limit",
+        type=int,
+        default=DEFAULT_YOLO_FILL_LIMIT,
+        metavar="N",
+        help=f"Hard cap on frames since last anchor refresh before the "
+        f"chain breaks regardless of misses (default: "
+        f"{DEFAULT_YOLO_FILL_LIMIT}; 0 disables the cap). Normally "
+        "--max-consecutive-misses is the right knob; this is a safety "
+        "net for pathological cases.",
+    )
+    p.add_argument(
+        "--snap-multiplier",
+        type=float,
+        default=DEFAULT_SNAP_MULTIPLIER,
+        metavar="FLOAT",
+        help=f"Multiplier applied to the per-video snap_threshold to "
+        f"bound how far a YOLO box can be from a tag's current anchor "
+        f"and still snap (default: {DEFAULT_SNAP_MULTIPLIER}). "
+        "Constant cap — does NOT grow with gap length.",
+    )
+    p.add_argument(
+        "--max-consecutive-misses",
+        type=int,
+        default=DEFAULT_MAX_CONSECUTIVE_MISSES,
+        metavar="N",
+        help=f"Chain breaks after this many consecutive frames without "
+        f"a successful YOLO snap (default: "
+        f"{DEFAULT_MAX_CONSECUTIVE_MISSES}). Tolerates short bursts of "
+        "bad YOLO detection while still cutting the chain when the tag "
+        "has truly left.",
+    )
+    from yoto.constants import (
+        DEFAULT_RECHAIN_AFFECTED_ONLY as _RECHAIN_AFFECTED_ONLY_DEFAULT,
+    )
+
+    p.add_argument(
+        "--rechain-affected-only",
+        type=_str_to_bool,
+        default=_RECHAIN_AFFECTED_ONLY_DEFAULT,
+        metavar="BOOL",
+        help=f"In the re-chain pass (step 6d), restrict candidate tags "
+        f"to only those whose YOLO fills were pruned in step 6c "
+        f"(default: {_RECHAIN_AFFECTED_ONLY_DEFAULT}). False (default) "
+        f"lets every tag compete for the freed YOLO boxes.",
+    )
     p.set_defaults(func=_run_clean)
 
 
@@ -894,12 +1136,32 @@ def _clean_one_pickle(
     interp_limit: int,
     max_jump: float,
     write_csv: bool = False,
+    yolo_fill: bool = True,
+    yolo_fill_limit: int | None = None,
+    snap_multiplier: float | None = None,
+    max_consecutive_misses: int | None = None,
+    rechain_affected_only: bool | None = None,
 ) -> tuple[str, str | None]:
     """Clean a single pickle. Returns ``(pkl_path, None)`` on success,
     or ``(pkl_path, error_message)`` on failure."""
     import traceback
 
     from yoto.cleaning import clean_tracking_data
+    from yoto.constants import (
+        DEFAULT_MAX_CONSECUTIVE_MISSES,
+        DEFAULT_RECHAIN_AFFECTED_ONLY,
+        DEFAULT_SNAP_MULTIPLIER,
+        DEFAULT_YOLO_FILL_LIMIT,
+    )
+
+    if yolo_fill_limit is None:
+        yolo_fill_limit = DEFAULT_YOLO_FILL_LIMIT
+    if snap_multiplier is None:
+        snap_multiplier = DEFAULT_SNAP_MULTIPLIER
+    if max_consecutive_misses is None:
+        max_consecutive_misses = DEFAULT_MAX_CONSECUTIVE_MISSES
+    if rechain_affected_only is None:
+        rechain_affected_only = DEFAULT_RECHAIN_AFFECTED_ONLY
 
     try:
         frame_data = pd.read_pickle(pkl_path)
@@ -908,11 +1170,31 @@ def _clean_one_pickle(
         if write_csv:
             raw_csv = os.path.splitext(pkl_path)[0] + ".csv"
             _write_csv(frame_data, raw_csv)
+
+        # Auto-discover the YOLO-fill source next to the raw pickle.
+        # The _yolo.pkl sidecar is the single source of YOLO boxes; we
+        # filter to the undecoded subset (decoded==False) for the fill.
+        undecoded_df = None
+        if yolo_fill and pkl_path.endswith(".pkl"):
+            yolo_path = pkl_path[:-4] + "_yolo.pkl"
+            if os.path.isfile(yolo_path):
+                yolo_df = pd.read_pickle(yolo_path)
+                undecoded_df = yolo_df[~yolo_df["decoded"].astype(bool)].copy()
+                print(
+                    f"YOLO-fill source: {os.path.basename(yolo_path)} "
+                    f"(filtered to {len(undecoded_df)} undecoded boxes)"
+                )
+
         cleaned, _id_list, metrics = clean_tracking_data(
             frame_data,
             min_detections=min_detections,
             interpolation_limit=interp_limit,
             max_jump_distance=max_jump,
+            undecoded_df=undecoded_df,
+            yolo_fill_limit=yolo_fill_limit,
+            snap_multiplier=snap_multiplier,
+            max_consecutive_misses=max_consecutive_misses,
+            rechain_affected_only=rechain_affected_only,
         )
         if output_path is None:
             clean_dir = _tracking_layout(_recording_dir_for_pickle(pkl_path))[
@@ -935,7 +1217,12 @@ def _clean_one_pickle(
             f" | errors={metrics['original_bad_count']} "
             f"({metrics['error_pct']:.2f}%) | "
             f"filled={metrics['filled_count']}/{metrics['total_gaps']} gaps "
-            f"({metrics['filled_pct_of_gaps']:.2f}% recovered)"
+            f"({metrics['filled_pct_of_gaps']:.2f}% recovered) | "
+            f"yolo_inferred={metrics['yolo_inferred_count']} "
+            f"({metrics['yolo_inferred_pct_of_gaps']:.2f}% of gaps) | "
+            f"pruned={metrics['yolo_pruned_count']} | "
+            f"rechained={metrics['yolo_rechained_count']} | "
+            f"snap_threshold={metrics['snap_threshold_px']:.1f}px"
         )
         return (pkl_path, None)
     except Exception:
@@ -997,6 +1284,11 @@ def _run_clean(args: argparse.Namespace) -> None:
             interp_limit=args.interp_limit,
             max_jump=args.max_jump,
             write_csv=args.csv,
+            yolo_fill=args.yolo_fill,
+            yolo_fill_limit=args.yolo_fill_limit,
+            snap_multiplier=args.snap_multiplier,
+            max_consecutive_misses=args.max_consecutive_misses,
+            rechain_affected_only=args.rechain_affected_only,
         )
         if result[1] is not None:
             logging.getLogger(__name__).error(
@@ -1072,6 +1364,28 @@ def _add_render_parser(subparsers: argparse._SubParsersAction) -> None:
         "cleaning pass. Implies --no-trails since raw data is gap-heavy.",
     )
     p.add_argument(
+        "--quads",
+        action="store_true",
+        help="Overlay undecoded raw quads (white polygons) from the "
+        "<stem>_quads.pkl sidecar, for visually verifying which gaps "
+        "have a candidate AprilTag quad nearby.",
+    )
+    p.add_argument(
+        "--undecoded",
+        action="store_true",
+        help="Overlay YOLO boxes (yellow rectangles) that AprilTag "
+        "failed to decode, from the <stem>_yolo.pkl sidecar filtered "
+        "to decoded==False. Coarser than --quads but more reliable.",
+    )
+    p.add_argument(
+        "--debug",
+        action="store_true",
+        help="Debug overlay: every YOLO box from <stem>_yolo.pkl coloured "
+        "by post-Phase-2 state (green=decoded original, yellow=matched by "
+        "YOLO-fill, red=still unrecovered) plus AprilTag decoded quads "
+        "(green polygons) for ORIGINAL tags.",
+    )
+    p.add_argument(
         "--text-scale",
         type=float,
         default=1.0,
@@ -1116,6 +1430,9 @@ def _render_single_video(
     text_scale_factor: float,
     raw: bool,
     codec: str,
+    overlay_quads: bool = False,
+    overlay_undecoded: bool = False,
+    debug: bool = False,
 ) -> tuple[str, str | None]:
     """Render one video. Returns ``(vpath, None)`` on success, or
     ``(vpath, traceback_text)`` on failure."""
@@ -1185,6 +1502,54 @@ def _render_single_video(
             out_name = f"{stem}{data_suffix}{raw_tag}.mp4"
         output_path = os.path.join(video_out_dir, out_name)
 
+        quads_data = None
+        if overlay_quads:
+            quads_path = _find_pickle_for_video(
+                vpath, data_suffix + "_quads", raw_only=True
+            )
+            if quads_path is None or not os.path.isfile(quads_path):
+                print(
+                    f"WARNING: --quads requested but no _quads.pkl sidecar "
+                    f"found for {vpath}; rendering without it."
+                )
+            else:
+                quads_data = pd.read_pickle(quads_path)
+                print(f"Overlaying quads from: {quads_path}")
+
+        undecoded_data = None
+        if overlay_undecoded:
+            # Read _yolo.pkl and filter to undecoded boxes.
+            yolo_path_for_und = _find_pickle_for_video(
+                vpath, data_suffix + "_yolo", raw_only=True
+            )
+            if yolo_path_for_und is not None and os.path.isfile(yolo_path_for_und):
+                yolo_df = pd.read_pickle(yolo_path_for_und)
+                undecoded_data = yolo_df[~yolo_df["decoded"].astype(bool)].copy()
+                print(
+                    f"Overlaying undecoded boxes from: {yolo_path_for_und} "
+                    f"({len(undecoded_data)} rows)"
+                )
+            else:
+                print(
+                    f"WARNING: --undecoded requested but no _yolo.pkl "
+                    f"sidecar found for {vpath}; rendering without it."
+                )
+
+        yolo_data = None
+        if debug:
+            yolo_path = _find_pickle_for_video(
+                vpath, data_suffix + "_yolo", raw_only=True
+            )
+            if yolo_path is None or not os.path.isfile(yolo_path):
+                print(
+                    f"WARNING: --debug requested but no _yolo.pkl sidecar "
+                    f"found for {vpath}; debug boxes will be skipped "
+                    "(quads will still draw if available)."
+                )
+            else:
+                yolo_data = pd.read_pickle(yolo_path)
+                print(f"Debug YOLO source: {yolo_path}")
+
         output = render_overlay_video(
             video_path=vpath,
             frame_data=cleaned,
@@ -1196,6 +1561,10 @@ def _render_single_video(
             draw_trails=draw_trails,
             text_scale_factor=text_scale_factor,
             codec=codec,
+            quads_data=quads_data,
+            undecoded_data=undecoded_data,
+            debug=debug,
+            yolo_data=yolo_data,
         )
         print(f"Output: {output}")
         return (vpath, None)
@@ -1264,6 +1633,12 @@ def _run_render(args: argparse.Namespace) -> None:
             worker_tmpl.append("--no-trails")
         if args.raw:
             worker_tmpl.append("--raw")
+        if args.quads:
+            worker_tmpl.append("--quads")
+        if args.undecoded:
+            worker_tmpl.append("--undecoded")
+        if args.debug:
+            worker_tmpl.append("--debug")
         input_root = (
             args.video_path
             if os.path.isdir(args.video_path)
@@ -1290,6 +1665,9 @@ def _run_render(args: argparse.Namespace) -> None:
                 text_scale_factor=args.text_scale,
                 raw=args.raw,
                 codec=args.codec,
+                overlay_quads=args.quads,
+                overlay_undecoded=args.undecoded,
+                debug=args.debug,
             )
             if result[1] is not None:
                 logging.getLogger(__name__).error(

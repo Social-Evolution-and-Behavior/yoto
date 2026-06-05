@@ -11,8 +11,8 @@ class TestConstants:
     def test_conf_threshold_range(self) -> None:
         assert 0.0 < C.DEFAULT_CONF_THRESHOLD <= 1.0
 
-    def test_pad_pixels_positive(self) -> None:
-        assert C.DEFAULT_PAD_PIXELS > 0
+    def test_pad_ratio_in_range(self) -> None:
+        assert 0.0 < C.DEFAULT_PAD_RATIO < 1.0
 
     def test_max_valid_tag_id_positive(self) -> None:
         assert C.MAX_VALID_TAG_ID > 0

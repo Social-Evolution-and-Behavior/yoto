@@ -7,15 +7,15 @@
 ### 1. Detect tags
 
 ```bash
-# Simple (portable) pipeline
-yoto detect /path/to/experiment.mp4 --yoloweights /path/to/detect14.pt
+# Fast (NVDEC + TensorRT) pipeline — default
+yoto detect /path/to/experiment.mp4 --yoloweights /path/to/yolo.pt
 
-# Fast (NVDEC + TensorRT) pipeline
-yoto detect /path/to/experiment.mp4 --yoloweights /path/to/detect14.engine --fast
+# Portable pipeline (any CUDA machine, no NVDEC required)
+yoto detect /path/to/experiment.mp4 --yoloweights /path/to/yolo.pt --use-nvdec False
 
 # Apply an AprilTag preset (built-in name, or path to a JSON file)
-yoto detect /path/to/experiment.mp4 --fast --apriltag-preset ir
-yoto detect /path/to/experiment.mp4 --fast --apriltag-preset /path/to/best_params.json
+yoto detect /path/to/experiment.mp4 --yoloweights /path/to/yolo.pt --apriltag-preset ir
+yoto detect /path/to/experiment.mp4 --yoloweights /path/to/yolo.pt --apriltag-preset /path/to/best_params.json
 ```
 
 See [Detection → AprilTag Presets](detection.md#apriltag-presets) for the
@@ -40,7 +40,7 @@ yoto render /path/to/experiment.mp4 --scale 0.5 --codec h264
 
 ```bash
 # Process every video under /path/to/recordings/ in parallel (3 workers)
-yoto detect /path/to/recordings/ --fast --parallel 3
+yoto detect /path/to/recordings/ --yoloweights /path/to/yolo.pt --parallel 3
 yoto clean  /path/to/recordings/
 yoto render /path/to/recordings/ --parallel 3
 ```
@@ -64,7 +64,7 @@ from yoto import run_detection_simple, clean_tracking_data, render_overlay_video
 
 df = run_detection_simple(
     "/path/to/experiment.mp4",
-    yolo_weights="/path/to/detect14.engine",
+    yolo_weights="/path/to/yolo.pt",
 )
 cleaned, ids, metrics = clean_tracking_data(df)
 render_overlay_video("/path/to/experiment.mp4", cleaned, ids, scale=0.5)

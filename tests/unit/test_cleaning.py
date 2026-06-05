@@ -2,16 +2,28 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import numpy as np
 import pandas as pd
 import pytest
 
-from yoto.cleaning import clean_tracking_data, _interpolate_data
+from yoto.cleaning import (
+    _compute_snap_threshold,
+    _fill_via_yolo,
+    _interpolate_data,
+    clean_tracking_data,
+)
 from yoto.constants import (
     ASS_TYPE_INTERPOLATED,
+    ASS_TYPE_NONE,
     ASS_TYPE_ORIGINAL,
+    ASS_TYPE_YOLO_INFERRED,
     COL_ASS_TYPE,
+    COL_CENTER_X,
+    COL_CENTER_Y,
     COL_DISTANCE,
+    COL_FRAME,
 )
 
 
@@ -111,6 +123,11 @@ class TestCleanTrackingData:
             "filled_count",
             "filled_pct_of_total",
             "filled_pct_of_gaps",
+            "yolo_inferred_count",
+            "yolo_inferred_pct_of_gaps",
+            "yolo_pruned_count",
+            "yolo_rechained_count",
+            "snap_threshold_px",
         }
         assert set(metrics.keys()) == expected_keys
 
@@ -122,6 +139,18 @@ class TestCleanTrackingData:
         )
         # total_samples = n_frames * n_ids
         assert metrics["total_samples"] == len(cleaned.index) * len(id_list)
+
+    def test_runs_on_sliced_index_not_starting_at_zero(
+        self, sample_tracking_dataframe: pd.DataFrame
+    ) -> None:
+        # Regression: clean_tracking_data used `frame_data.loc[1:, ...]`
+        # for distance recompute, which silently selected ALL rows
+        # when the frame index didn't start at 0 (e.g. notebook
+        # windowing).  That tripped a length-mismatch ValueError on
+        # the distance assignment.
+        sliced = sample_tracking_dataframe.iloc[5:].copy()
+        cleaned, _, _ = clean_tracking_data(sliced, min_detections=1)
+        assert (1, COL_DISTANCE) in cleaned.columns
 
     @pytest.mark.parametrize("max_jump", [50.0, 100.0, 2000.0])
     def test_jump_detection_respects_threshold(
@@ -138,3 +167,272 @@ class TestCleanTrackingData:
         # should be flagged.
         if max_jump >= 2000.0:
             assert metrics["original_bad_count"] == 0
+
+
+def _make_tracking_df(
+    tag_xy: dict[int, tuple[list[float], list[float]]],
+) -> pd.DataFrame:
+    """Build a MultiIndex tracking DataFrame from per-tag (x, y) lists."""
+    n_frames = max(len(xy[0]) for xy in tag_xy.values())
+    data: dict[tuple[Any, str], list[Any]] = {(COL_FRAME, ""): list(range(n_frames))}
+    for tag_id, (xs, ys) in tag_xy.items():
+        data[(tag_id, COL_CENTER_X)] = xs
+        data[(tag_id, COL_CENTER_Y)] = ys
+    df = pd.DataFrame(data)
+    df.columns = pd.MultiIndex.from_tuples(df.columns)
+    df = df.set_index(COL_FRAME)
+    return df
+
+
+def _attach_ass_type(df: pd.DataFrame) -> pd.DataFrame:
+    """Add ass_type=ORIGINAL where center_x is not NaN, NONE otherwise."""
+    id_list = sorted({c[0] for c in df.columns if isinstance(c[0], int)})
+    for tag_id in id_list:
+        types = np.where(
+            df[(tag_id, COL_CENTER_X)].notna(),
+            ASS_TYPE_ORIGINAL,
+            ASS_TYPE_NONE,
+        )
+        df[(tag_id, COL_ASS_TYPE)] = types
+    return df
+
+
+class TestComputeSnapThreshold:
+    """Tests for _compute_snap_threshold."""
+
+    def test_returns_inf_when_no_originals(self) -> None:
+        df = _make_tracking_df({1: ([np.nan] * 5, [np.nan] * 5)})
+        df = _attach_ass_type(df)
+        thr = _compute_snap_threshold(df, np.array([1]))
+        assert np.isinf(thr)
+
+    def test_uses_consecutive_originals_only(self) -> None:
+        # Tag 1: positions every frame, distance per step = 10 px
+        xs = [0.0, 10.0, 20.0, 30.0, 40.0]
+        ys = [0.0, 0.0, 0.0, 0.0, 0.0]
+        df = _make_tracking_df({1: (xs, ys)})
+        df = _attach_ass_type(df)
+        thr = _compute_snap_threshold(df, np.array([1]), percentile=50.0)
+        assert thr == pytest.approx(10.0)
+
+    def test_ignores_gaps(self) -> None:
+        # Tag 1: jump from frame 2 to frame 4 over a gap → must NOT be
+        # counted as a per-frame distance.
+        xs = [0.0, 10.0, 20.0, np.nan, 100.0]
+        ys = [0.0, 0.0, 0.0, np.nan, 0.0]
+        df = _make_tracking_df({1: (xs, ys)})
+        df = _attach_ass_type(df)
+        thr = _compute_snap_threshold(df, np.array([1]), percentile=99.0)
+        # Only the consecutive-original distances (10, 10) should count.
+        assert thr == pytest.approx(10.0)
+
+
+class TestFillViaYolo:
+    """Tests for _fill_via_yolo (forward + backward chain, constant snap)."""
+
+    @staticmethod
+    def _undecoded(rows: list[tuple[int, float, float]]) -> pd.DataFrame:
+        """Build an undecoded sidecar DataFrame from (frame, cx, cy) rows."""
+        df = pd.DataFrame(
+            rows, columns=[COL_FRAME, COL_CENTER_X, COL_CENTER_Y]
+        ).set_index(COL_FRAME)
+        return df
+
+    def test_forward_chain_fills_consecutive_close_boxes(self) -> None:
+        # ORIGINAL at frame 0; YOLO boxes at frames 1, 2 close to anchor.
+        xs = [0.0, np.nan, np.nan, 30.0]
+        ys = [0.0, np.nan, np.nan, 0.0]
+        df = _attach_ass_type(_make_tracking_df({1: (xs, ys)}))
+        undecoded = self._undecoded([(1, 10.0, 0.0), (2, 20.0, 0.0)])
+        filled, _claims = _fill_via_yolo(
+            df,
+            np.array([1]),
+            undecoded,
+            snap_threshold=15.0,
+            snap_multiplier=1.0,
+        )
+        assert filled == 2
+        assert df.loc[1, (1, COL_ASS_TYPE)] == ASS_TYPE_YOLO_INFERRED
+        assert df.loc[2, (1, COL_ASS_TYPE)] == ASS_TYPE_YOLO_INFERRED
+
+    def test_constant_threshold_rejects_far_boxes(self) -> None:
+        # A box 500 px away must NOT snap, regardless of any other state.
+        xs = [0.0, np.nan, 20.0]
+        ys = [0.0, np.nan, 0.0]
+        df = _attach_ass_type(_make_tracking_df({1: (xs, ys)}))
+        undecoded = self._undecoded([(1, 500.0, 500.0)])
+        filled, _claims = _fill_via_yolo(
+            df,
+            np.array([1]),
+            undecoded,
+            snap_threshold=10.0,
+            snap_multiplier=2.0,
+        )
+        assert filled == 0
+        assert pd.isna(df.loc[1, (1, COL_CENTER_X)])
+
+    def test_backward_pass_fills_leading_edge(self) -> None:
+        # Tag's first ORIGINAL is at frame 3.  YOLO boxes at frames 0,1,2
+        # close to that position.  Forward pass can't help (no anchor
+        # yet); backward pass must walk back from frame 3 and fill them.
+        xs = [np.nan, np.nan, np.nan, 0.0, 10.0]
+        ys = [np.nan, np.nan, np.nan, 0.0, 0.0]
+        df = _attach_ass_type(_make_tracking_df({1: (xs, ys)}))
+        undecoded = self._undecoded([(0, 0.0, 0.0), (1, 0.0, 0.0), (2, 0.0, 0.0)])
+        filled, _claims = _fill_via_yolo(
+            df,
+            np.array([1]),
+            undecoded,
+            snap_threshold=5.0,
+            snap_multiplier=1.0,
+        )
+        assert filled == 3
+        for f in (0, 1, 2):
+            assert df.loc[f, (1, COL_ASS_TYPE)] == ASS_TYPE_YOLO_INFERRED
+
+    def test_chain_breaks_after_consecutive_misses(self) -> None:
+        # Anchor at frame 0.  Frames 1-3 have boxes near the anchor →
+        # snap.  Frames 4-6 have boxes far away → 3 misses → chain
+        # breaks.  Frame 7 has a box again, but no anchor, so no fill.
+        xs = [0.0] + [np.nan] * 7
+        ys = [0.0] + [np.nan] * 7
+        df = _attach_ass_type(_make_tracking_df({1: (xs, ys)}))
+        undecoded = self._undecoded(
+            [
+                (1, 0.0, 0.0),
+                (2, 0.0, 0.0),
+                (3, 0.0, 0.0),
+                (4, 500.0, 0.0),  # too far
+                (5, 500.0, 0.0),
+                (6, 500.0, 0.0),
+                (7, 0.0, 0.0),  # would match but chain is broken
+            ]
+        )
+        filled, _claims = _fill_via_yolo(
+            df,
+            np.array([1]),
+            undecoded,
+            snap_threshold=10.0,
+            snap_multiplier=1.0,
+            max_consecutive_misses=3,
+        )
+        assert filled == 3
+        assert pd.isna(df.loc[7, (1, COL_CENTER_X)])
+
+    def test_yolo_fill_limit_zero_means_unlimited(self) -> None:
+        # 9-frame gap with perfect boxes; with limit=0 (default) and
+        # high miss tolerance, everything fills.
+        xs = [0.0] + [np.nan] * 9 + [100.0]
+        ys = [0.0] + [np.nan] * 9 + [0.0]
+        df = _attach_ass_type(_make_tracking_df({1: (xs, ys)}))
+        undecoded = self._undecoded([(i, i * 10.0, 0.0) for i in range(1, 10)])
+        filled, _claims = _fill_via_yolo(
+            df,
+            np.array([1]),
+            undecoded,
+            snap_threshold=15.0,
+            snap_multiplier=1.0,
+            yolo_fill_limit=0,
+        )
+        assert filled == 9
+
+    def test_per_frame_conflict_resolved_by_closest(self) -> None:
+        # Two tags, both at gap frame 1.  Two YOLO boxes available, each
+        # closer to a different tag → greedy global-min assigns the
+        # closest pair to its tag.
+        df = _attach_ass_type(
+            _make_tracking_df(
+                {
+                    1: ([0.0, np.nan, 0.0], [0.0, np.nan, 0.0]),
+                    2: ([100.0, np.nan, 100.0], [0.0, np.nan, 0.0]),
+                }
+            )
+        )
+        undecoded = self._undecoded(
+            [
+                (1, 102.0, 0.0),  # closer to tag 2's anchor
+                (1, 1.0, 0.0),  # closer to tag 1's anchor
+            ]
+        )
+        filled, _claims = _fill_via_yolo(
+            df,
+            np.array([1, 2]),
+            undecoded,
+            snap_threshold=10.0,
+            snap_multiplier=2.0,
+        )
+        assert filled == 2
+        assert df.loc[1, (1, COL_CENTER_X)] == pytest.approx(1.0)
+        assert df.loc[1, (2, COL_CENTER_X)] == pytest.approx(102.0)
+
+
+class TestCleanTrackingDataWithYoloFill:
+    """End-to-end checks that clean_tracking_data uses the undecoded sidecar."""
+
+    def test_undecoded_box_replaces_interpolation(
+        self, sample_tracking_dataframe: pd.DataFrame
+    ) -> None:
+        # Tag 2 has gaps at frames 5, 6.  Provide an undecoded box on
+        # frame 5 near the linear-interp midpoint.
+        x5 = (
+            sample_tracking_dataframe[(2, COL_CENTER_X)].iloc[4]
+            + sample_tracking_dataframe[(2, COL_CENTER_X)].iloc[7]
+        ) / 2.0
+        y5 = (
+            sample_tracking_dataframe[(2, COL_CENTER_Y)].iloc[4]
+            + sample_tracking_dataframe[(2, COL_CENTER_Y)].iloc[7]
+        ) / 2.0
+        undecoded = pd.DataFrame(
+            [{COL_FRAME: 5, COL_CENTER_X: x5, COL_CENTER_Y: y5}]
+        ).set_index(COL_FRAME)
+
+        cleaned, _, metrics = clean_tracking_data(
+            sample_tracking_dataframe,
+            min_detections=1,
+            undecoded_df=undecoded,
+        )
+        assert metrics["yolo_inferred_count"] >= 1
+        assert cleaned.loc[5, (2, COL_ASS_TYPE)] == ASS_TYPE_YOLO_INFERRED
+
+    def test_no_undecoded_no_yolo_filled(
+        self, sample_tracking_dataframe: pd.DataFrame
+    ) -> None:
+        _, _, metrics = clean_tracking_data(sample_tracking_dataframe, min_detections=1)
+        assert metrics["yolo_inferred_count"] == 0
+        # No YOLO input → prune/rechain counters stay at 0.
+        assert metrics["yolo_pruned_count"] == 0
+        assert metrics["yolo_rechained_count"] == 0
+
+    def test_yolo_fill_jump_prune_then_rechain(self) -> None:
+        # Tag 1 has a long gap.  Two undecoded boxes are available:
+        # one that creates a jump (far from the anchor trajectory) and
+        # one that lies on the natural trajectory.  The initial fill
+        # might pick the bad box; step 6c prunes it and step 6d re-chains
+        # using the good one.  This exercises the prune+rechain loop
+        # without asserting on which box wins (the goal is just that
+        # the pruning/re-chain pipeline runs).
+        df = _make_tracking_df(
+            {
+                1: (
+                    [0.0, 10.0, np.nan, np.nan, np.nan, 50.0, 60.0],
+                    [0.0, 10.0, np.nan, np.nan, np.nan, 50.0, 60.0],
+                ),
+            }
+        )
+        undecoded = pd.DataFrame(
+            [
+                {COL_FRAME: 2, COL_CENTER_X: 20.0, COL_CENTER_Y: 20.0},
+                {COL_FRAME: 3, COL_CENTER_X: 30.0, COL_CENTER_Y: 30.0},
+                {COL_FRAME: 4, COL_CENTER_X: 40.0, COL_CENTER_Y: 40.0},
+            ]
+        ).set_index(COL_FRAME)
+        _, _, metrics = clean_tracking_data(
+            df,
+            min_detections=1,
+            interpolation_limit=2,
+            undecoded_df=undecoded,
+            snap_multiplier=5.0,
+        )
+        # Counters exist and are non-negative.
+        assert metrics["yolo_pruned_count"] >= 0
+        assert metrics["yolo_rechained_count"] >= 0

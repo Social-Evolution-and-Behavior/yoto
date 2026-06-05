@@ -12,9 +12,9 @@ from yoto import run_detection_simple
 
 df = run_detection_simple(
     "video.mp4",
-    yolo_weights="detect14.engine",
+    yolo_weights="yolo.pt",
     conf_threshold=0.1,
-    pad_pixels=10,
+    pad_ratio=0.34,
 )
 ```
 
@@ -32,7 +32,7 @@ from yoto import run_detection_fast
 
 df = run_detection_fast(
     "video.mp4",
-    yolo_weights="detect14.engine",
+    yolo_weights="yolo.pt",
     batch_size=20,
     target_size=1024,
     debug=True,  # prints per-stage profiling
@@ -49,7 +49,7 @@ crashes NVDEC via CUDA-context poisoning).
 Export with `dynamic=True` so the engine accepts variable batch sizes:
 
 ```bash
-yolo export model=detect14.pt format=engine imgsz=1024 \
+yolo export model=yolo.pt format=engine imgsz=1024 \
     half=True batch=20 dynamic=True
 ```
 
@@ -64,7 +64,7 @@ For `.onnx` weights the fast pipeline uses ONNX Runtime's
 GPU (zero-copy via `data_ptr()`). Portable across GPUs, no version lock.
 
 ```bash
-yolo export model=detect14.pt format=onnx imgsz=1024 \
+yolo export model=yolo.pt format=onnx imgsz=1024 \
     half=True dynamic=True simplify=True
 ```
 
@@ -81,10 +81,10 @@ reversible (omit the flag to revert).
 
 ```bash
 # Built-in preset (looked up in src/yoto/presets/)
-yoto detect video.mp4 --fast --apriltag-preset ir
+yoto detect video.mp4 --yoloweights yolo.pt --apriltag-preset ir
 
 # Or a JSON file on disk (e.g. an Optuna best-params dump)
-yoto detect video.mp4 --fast --apriltag-preset /path/to/best_params.json
+yoto detect video.mp4 --yoloweights yolo.pt --apriltag-preset /path/to/best_params.json
 ```
 
 From Python:
@@ -92,7 +92,7 @@ From Python:
 ```python
 run_detection_fast(
     "video.mp4",
-    yolo_weights="detect14.engine",
+    yolo_weights="yolo.pt",
     preset="ir",  # or "/path/to/best_params.json"
 )
 ```
@@ -135,14 +135,25 @@ The shipped `ir.json` preset was produced by an Optuna sweep on
 infrared-illuminated footage; new presets can be dropped into
 `src/yoto/presets/` to be discovered by name.
 
+## Key Flags
+
+| Flag | Default | Effect |
+|------|---------|--------|
+| `--pad-ratio` | `0.34` | Per-axis padding added around each YOLO box before cropping (scales with tag size) |
+| `--tag-offset-filter` | `True` | Drop AprilTag decodes whose center is too far from the source YOLO box center — catches misdecodes in padding regions |
+| `--max-tag-offset-ratio` | `0.6` | Distance threshold for `--tag-offset-filter`, as a fraction of `min(box_w, box_h)` |
+| `--save-yolo` | `True` | Write the `_yolo.pkl` sidecar (disable if not using YOLO-fill in clean) |
+| `--save-quads` | `False` | Write the `_quads.pkl` sidecar (only needed for `render --quads` debug overlay) |
+| `--use-nvdec` | `True` | Use NVDEC hardware decoding (fast pipeline); `False` falls back to the portable Ultralytics pipeline |
+
 ## How It Works
 
 1. **YOLO detection** — a trained YOLOv8 model locates ant bounding boxes
-2. **Cropping** — detected regions are padded and cropped from the frame
+2. **Cropping** — detected regions are padded by `pad_ratio × box_dim` on each side (scales with apparent tag size) and cropped from the frame
 3. **Composite strip** — crops are packed side-by-side into one wide image
 4. **Image enhancement** — unsharp masking and contrast boosting
 5. **AprilTag decoding** — the SEBLab detector runs once on the composite (parameters configurable via a preset; see above)
-6. **Reprojection** — tag coordinates are mapped back to the original frame
+6. **Reprojection + offset filter** — tag coordinates are mapped back to the original frame; decodes whose center is farther than `max_tag_offset_ratio × min(box_w, box_h)` from the source YOLO box center are dropped (catches misdecodes in padding regions). Disable with `--tag-offset-filter False`.
 
 ## Output Format
 
@@ -151,4 +162,11 @@ Both pipelines produce a pandas DataFrame with a MultiIndex:
 - **Index**: frame number
 - **Columns**: `(tag_id, "center_x")`, `(tag_id, "center_y")`, `(tag_id, "corners")`
 
-The DataFrame is saved as a pickle file alongside the input video.
+The DataFrame is saved as `<stem><dataname>.pkl` in `tracking/raw_data/`.
+
+Two optional sidecars are written next to the main pickle:
+
+| File | Default | Content |
+|------|---------|---------|
+| `<stem>_yolo.pkl` | always (disable with `--save-yolo False`) | Every YOLO box per frame with columns `box_x1/y1/x2/y2`, `center_x/y`, `confidence`, `decoded`, `tag_id` (`-1` when undecoded). Used by `yoto clean --yolo-fill True` and `yoto render --undecoded`. |
+| `<stem>_quads.pkl` | off by default (`--save-quads True` to enable) | Raw AprilTag quads (4×2 corner arrays) for every quad found, decoded or not. Used by `yoto render --quads` for debug overlays. |

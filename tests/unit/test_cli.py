@@ -103,10 +103,12 @@ class TestBuildWorkerCmd:
 
         defaults = {
             "output_dir": None,
-            "yoloweights": "detect14.engine",
+            "yoloweights": "detect14.pt",
             "dataname": "_apriltagDetect14",
-            "fast": False,
+            "use_nvdec": True,
             "debug": False,
+            "save_yolo": True,
+            "save_quads": False,
         }
         defaults.update(overrides)
         return argparse.Namespace(**defaults)
@@ -117,13 +119,16 @@ class TestBuildWorkerCmd:
         assert "detect" in cmd
         assert "/vids/a.mp4" in cmd
         assert "--yoloweights" in cmd
-        assert "--fast" not in cmd
+        # --use-nvdec is always forwarded with its bool value.
+        assert "--use-nvdec" in cmd
+        assert cmd[cmd.index("--use-nvdec") + 1] == "True"
         assert "--debug" not in cmd
 
-    def test_fast_and_debug_forwarded(self) -> None:
-        args = self._make_args(fast=True, debug=True)
+    def test_use_nvdec_false_and_debug_forwarded(self) -> None:
+        args = self._make_args(use_nvdec=False, debug=True)
         cmd = _build_worker_cmd("/vids/a.mp4", args)  # type: ignore[arg-type]
-        assert "--fast" in cmd
+        assert "--use-nvdec" in cmd
+        assert cmd[cmd.index("--use-nvdec") + 1] == "False"
         assert "--debug" in cmd
 
     def test_output_dir_forwarded(self) -> None:

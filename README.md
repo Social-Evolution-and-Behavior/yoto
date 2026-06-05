@@ -18,7 +18,7 @@ In a reference benchmark, 7 days of 10 fps 4512×4512 footage of 100 clonal raid
 
 - **Two-stage detection** (YOLO → AprilTag): an order-of-magnitude faster than running AprilTag on full frames, with fewer false positives in busy scenes
 - **End-to-end pipeline**: `detect → clean → render` — raw decode, automatic gap-filling and jump-detection on trajectories, and overlay-video rendering
-- **GPU end-to-end**: NVDEC decode → TensorRT / ONNX YOLO inference → AprilTag → NVENC encode; threaded ffmpeg render ~2–3× faster than single-threaded `cv2.VideoWriter`
+- **GPU end-to-end**: NVDEC decode → YOLO inference → AprilTag → NVENC encode; threaded ffmpeg render ~2–3× faster than single-threaded `cv2.VideoWriter`
 - **AprilTag presets**: swap detection / image-processing parameters non-destructively via `--apriltag-preset` (built-in `ir` preset, plus support for any JSON file including Optuna `best_params*.json` dumps)
 - **Two detection backends**: portable simple mode (any CUDA box) and NVDEC-accelerated fast mode for production runs
 - **Batch processing**: `--parallel N` on `detect` / `render` dispatches one worker per video via GNU parallel, with a live human-readable `progress.txt`
@@ -53,8 +53,8 @@ The `fast` extra pulls in `torch`, `pynvvideocodec`, `tensorrt`, and `onnxruntim
 ## Quick Example
 
 ```bash
-# Step 1: Detect tags (NVDEC fast pipeline + TensorRT engine)
-yoto detect /path/to/experiment.mp4 --yoloweights /path/to/detect14.engine --fast
+# Step 1: Detect tags (NVDEC fast pipeline + TensorRT engine, default)
+yoto detect /path/to/experiment.mp4 --yoloweights /path/to/yolo.pt
 
 # Step 2: Clean and interpolate the raw tracking data
 yoto clean /path/to/experiment.mp4
@@ -69,9 +69,9 @@ yoto render /path/to/experiment.mp4
 
 ```bash
 # Detection
-yoto detect /path/to/experiment.mp4 --fast
-yoto detect /path/to/experiment.mp4 --fast --apriltag-preset ir   # IR-illuminated footage
-yoto detect /path/to/recordings/ --parallel 3                     # batch over a tree
+yoto detect /path/to/experiment.mp4 --yoloweights /path/to/yolo.pt
+yoto detect /path/to/experiment.mp4 --yoloweights /path/to/yolo.pt --apriltag-preset ir   # IR-illuminated footage
+yoto detect /path/to/recordings/ --yoloweights /path/to/yolo.pt --parallel 3              # batch over a tree
 
 # Cleaning
 yoto clean /path/to/experiment.mp4
@@ -133,6 +133,7 @@ mkdocs build               # static site under ./site/
 
 - Implement a pipeline to semi-automatically retrain the YOLO model and AprilTag presets
 - Document the API for data analysis
+- Auto px→mm calibration: infer the pixel-to-millimetre ratio from known AprilTag physical size and save it as metadata in the output pickle
 
 ## License
 

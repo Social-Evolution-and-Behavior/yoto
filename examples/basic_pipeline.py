@@ -23,7 +23,7 @@ def main() -> None:
 
     # Step 1: Detect AprilTags using the simple (portable) pipeline
     print("Step 1: Running detection...")
-    df = run_detection_simple(video_path, yolo_weights="detect14.engine")
+    df = run_detection_simple(video_path, yolo_weights="yolo.pt")
 
     # Step 2: Clean and interpolate the raw tracking data
     print("Step 2: Cleaning data...")

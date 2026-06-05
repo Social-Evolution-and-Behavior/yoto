@@ -23,7 +23,7 @@ In a reference benchmark, 7 days of 10 fps 4512×4512 footage of 100 clonal raid
 
 ```bash
 # Step 1: Detect tags (NVDEC fast pipeline + TensorRT engine)
-yoto detect /path/to/recording --yoloweights models/detect14.pt --fast --parallel 5
+yoto detect /path/to/recording --yoloweights /path/to/yolo.pt --fast --parallel 5
 
 # Step 2: Clean and interpolate the raw tracking data
 yoto clean /path/to/recording
