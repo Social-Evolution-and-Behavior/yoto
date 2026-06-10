@@ -80,6 +80,73 @@ def _str_to_bool(s: str) -> bool:
     raise argparse.ArgumentTypeError(f"Boolean value expected (True/False), got {s!r}")
 
 
+#: Named colors in BGR (OpenCV native) for the render highlight flag.
+_NAMED_COLORS_BGR: dict[str, tuple[int, int, int]] = {
+    "red": (0, 0, 255),
+    "green": (0, 255, 0),
+    "blue": (255, 0, 0),
+    "yellow": (0, 255, 255),
+    "cyan": (255, 255, 0),
+    "magenta": (255, 0, 255),
+    "white": (255, 255, 255),
+    "black": (0, 0, 0),
+}
+
+
+def _parse_id_list(tokens: list[str] | None) -> list[int]:
+    """Parse a space- or comma-separated list of tag IDs.
+
+    argparse hands us ``nargs="+"`` tokens; each token may itself be a
+    comma-separated group (``"42,87"``).  Flatten, split, strip, and
+    convert to ``int``.  Empty input returns ``[]``.
+    """
+    if not tokens:
+        return []
+    ids: list[int] = []
+    for token in tokens:
+        for part in token.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                ids.append(int(part))
+            except ValueError as exc:
+                raise argparse.ArgumentTypeError(
+                    f"--highlight-ids: expected integer IDs, got {part!r}"
+                ) from exc
+    return ids
+
+
+def _parse_color_bgr(s: str) -> tuple[int, int, int]:
+    """Parse a color spec into a BGR triple.
+
+    Accepts a name from :data:`_NAMED_COLORS_BGR` (case-insensitive) or
+    a comma-separated ``R,G,B`` triple in 0-255.  The R,G,B form is
+    user-facing (matches what people read off color pickers); the
+    returned tuple is BGR because OpenCV draws in BGR.
+    """
+    key = s.strip().lower()
+    if key in _NAMED_COLORS_BGR:
+        return _NAMED_COLORS_BGR[key]
+    parts = [p.strip() for p in s.split(",")]
+    if len(parts) != 3:
+        raise argparse.ArgumentTypeError(
+            f"--highlight-color: expected a named color or 'R,G,B', got {s!r}"
+        )
+    try:
+        r, g, b = (int(p) for p in parts)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"--highlight-color: R,G,B values must be integers, got {s!r}"
+        ) from exc
+    for v in (r, g, b):
+        if not 0 <= v <= 255:
+            raise argparse.ArgumentTypeError(
+                f"--highlight-color: each channel must be 0-255, got {s!r}"
+            )
+    return (b, g, r)
+
+
 def _resolve_video_paths(path: str) -> list[str]:
     """Resolve *path* to a list of video file paths.
 
@@ -313,8 +380,17 @@ def _add_detect_parser(subparsers: argparse._SubParsersAction) -> None:
         DEFAULT_IOU_THRESHOLD,
         DEFAULT_MAX_TAG_OFFSET_RATIO,
         DEFAULT_PAD_RATIO,
+        DEFAULT_TAG_FAMILY,
     )
 
+    p.add_argument(
+        "--tag-family",
+        default=DEFAULT_TAG_FAMILY,
+        metavar="NAME",
+        help=f"AprilTag family passed to the decoder "
+        f"(default: {DEFAULT_TAG_FAMILY}). Change this to decode a "
+        "different tag family (e.g. 'tag25h9', 'tag36h11').",
+    )
     p.add_argument(
         "--conf",
         type=float,
@@ -416,6 +492,7 @@ def _run_single_video(
     max_tag_offset_ratio: float | None = None,
     save_yolo: bool = True,
     save_quads: bool = False,
+    tag_family: str | None = None,
 ) -> tuple[str, str | None]:
     """Run detection on one video. Returns ``(vpath, None)`` on success,
     or ``(vpath, traceback_text)`` on failure."""
@@ -426,6 +503,7 @@ def _run_single_video(
         DEFAULT_IOU_THRESHOLD,
         DEFAULT_MAX_TAG_OFFSET_RATIO,
         DEFAULT_PAD_RATIO,
+        DEFAULT_TAG_FAMILY,
     )
 
     if conf is None:
@@ -436,6 +514,8 @@ def _run_single_video(
         pad_ratio = DEFAULT_PAD_RATIO
     if max_tag_offset_ratio is None:
         max_tag_offset_ratio = DEFAULT_MAX_TAG_OFFSET_RATIO
+    if tag_family is None:
+        tag_family = DEFAULT_TAG_FAMILY
 
     if output_dir is None:
         output_dir = _tracking_layout(_recording_dir_for_video(vpath))["raw_data"]
@@ -458,6 +538,7 @@ def _run_single_video(
                 max_offset_ratio=max_tag_offset_ratio,
                 save_yolo=save_yolo,
                 save_quads=save_quads,
+                tag_family=tag_family,
             )
         else:
             if nms_mode != "suppress":
@@ -480,6 +561,7 @@ def _run_single_video(
                 max_offset_ratio=max_tag_offset_ratio,
                 save_yolo=save_yolo,
                 save_quads=save_quads,
+                tag_family=tag_family,
             )
         return (vpath, None)
     except Exception:
@@ -511,6 +593,8 @@ def _build_worker_cmd(
         cmd.extend(["--pad-ratio", str(args.pad_ratio)])
     if getattr(args, "max_tag_offset_ratio", None) is not None:
         cmd.extend(["--max-tag-offset-ratio", str(args.max_tag_offset_ratio)])
+    if getattr(args, "tag_family", None):
+        cmd.extend(["--tag-family", args.tag_family])
     cmd.extend(["--save-yolo", str(args.save_yolo)])
     cmd.extend(["--save-quads", str(args.save_quads)])
     return cmd
@@ -911,6 +995,7 @@ def _run_detect(args: argparse.Namespace) -> None:
         worker_tmpl.extend(["--nms-mode", args.nms_mode])
         worker_tmpl.extend(["--pad-ratio", str(args.pad_ratio)])
         worker_tmpl.extend(["--max-tag-offset-ratio", str(args.max_tag_offset_ratio)])
+        worker_tmpl.extend(["--tag-family", args.tag_family])
         worker_tmpl.extend(["--save-yolo", str(args.save_yolo)])
         worker_tmpl.extend(["--save-quads", str(args.save_quads)])
         input_root = (
@@ -944,6 +1029,7 @@ def _run_detect(args: argparse.Namespace) -> None:
                 max_tag_offset_ratio=args.max_tag_offset_ratio,
                 save_yolo=args.save_yolo,
                 save_quads=args.save_quads,
+                tag_family=args.tag_family,
             )
             if result[1] is not None:
                 logging.getLogger(__name__).error(
@@ -1097,7 +1183,10 @@ def _add_clean_parser(subparsers: argparse._SubParsersAction) -> None:
         "has truly left.",
     )
     from yoto.constants import (
+        DEFAULT_FINAL_JUMP_PASS as _FINAL_JUMP_PASS_DEFAULT,
+        DEFAULT_MIN_GAP_RECOVERY_FRAMES as _MIN_GAP_RECOVERY_FRAMES_DEFAULT,
         DEFAULT_RECHAIN_AFFECTED_ONLY as _RECHAIN_AFFECTED_ONLY_DEFAULT,
+        DEFAULT_RECOVER_LONG_GAPS as _RECOVER_LONG_GAPS_DEFAULT,
     )
 
     p.add_argument(
@@ -1109,6 +1198,59 @@ def _add_clean_parser(subparsers: argparse._SubParsersAction) -> None:
         f"to only those whose YOLO fills were pruned in step 6c "
         f"(default: {_RECHAIN_AFFECTED_ONLY_DEFAULT}). False (default) "
         f"lets every tag compete for the freed YOLO boxes.",
+    )
+    p.add_argument(
+        "--recover-long-gaps",
+        type=_str_to_bool,
+        default=_RECOVER_LONG_GAPS_DEFAULT,
+        metavar="BOOL",
+        help=f"Experimental.  After step 7, for each tag with a NaN gap "
+        f"longer than --min-gap-recovery-frames, snap each gap frame to "
+        f"the closest unclaimed YOLO box within snap_threshold * "
+        f"snap_multiplier of the gap's leading or trailing anchor "
+        f"(anchors are fixed — they don't drift) "
+        f"(default: {_RECOVER_LONG_GAPS_DEFAULT}).",
+    )
+    p.add_argument(
+        "--min-gap-recovery-frames",
+        type=int,
+        default=_MIN_GAP_RECOVERY_FRAMES_DEFAULT,
+        metavar="N",
+        help=f"Minimum gap length (frames) for --recover-long-gaps to "
+        f"fire on a given gap "
+        f"(default: {_MIN_GAP_RECOVERY_FRAMES_DEFAULT}).",
+    )
+    p.add_argument(
+        "--final-jump-pass",
+        type=_str_to_bool,
+        default=_FINAL_JUMP_PASS_DEFAULT,
+        metavar="BOOL",
+        help=f"Experimental.  Run an extra _delete_jump_blocks round at "
+        f"step 9 on the fully-recovered data "
+        f"(default: {_FINAL_JUMP_PASS_DEFAULT}).",
+    )
+    p.add_argument(
+        "--debug-snapshots",
+        type=_str_to_bool,
+        default=False,
+        metavar="BOOL",
+        help="Debug.  Pickle the frame_data at each major cleaning "
+        "checkpoint to "
+        "<clean_dir>/<stem>_snapshots/step{6a,6c,6d,6f,7,8}_*.pkl. "
+        "Inspect them in a notebook to see exactly what each step "
+        "did.  Off by default.",
+    )
+    from yoto.constants import DEFAULT_TAG_SIZE_MM as _TAG_SIZE_MM_DEFAULT
+
+    p.add_argument(
+        "--tag-size",
+        type=float,
+        default=_TAG_SIZE_MM_DEFAULT,
+        metavar="MM",
+        help=f"Physical side length of one AprilTag border, in "
+        f"millimetres (default: {_TAG_SIZE_MM_DEFAULT}). Used to "
+        f"compute a mm_per_px scale from decoded tag corners; stored "
+        f"on the clean pkl as the 'yoto_mm_per_px' attr.",
     )
     p.set_defaults(func=_run_clean)
 
@@ -1141,6 +1283,11 @@ def _clean_one_pickle(
     snap_multiplier: float | None = None,
     max_consecutive_misses: int | None = None,
     rechain_affected_only: bool | None = None,
+    recover_long_gaps: bool | None = None,
+    min_gap_recovery_frames: int | None = None,
+    final_jump_pass: bool | None = None,
+    tag_size_mm: float | None = None,
+    debug_snapshots: bool = False,
 ) -> tuple[str, str | None]:
     """Clean a single pickle. Returns ``(pkl_path, None)`` on success,
     or ``(pkl_path, error_message)`` on failure."""
@@ -1148,9 +1295,13 @@ def _clean_one_pickle(
 
     from yoto.cleaning import clean_tracking_data
     from yoto.constants import (
+        DEFAULT_FINAL_JUMP_PASS,
         DEFAULT_MAX_CONSECUTIVE_MISSES,
+        DEFAULT_MIN_GAP_RECOVERY_FRAMES,
         DEFAULT_RECHAIN_AFFECTED_ONLY,
+        DEFAULT_RECOVER_LONG_GAPS,
         DEFAULT_SNAP_MULTIPLIER,
+        DEFAULT_TAG_SIZE_MM,
         DEFAULT_YOLO_FILL_LIMIT,
     )
 
@@ -1162,6 +1313,14 @@ def _clean_one_pickle(
         max_consecutive_misses = DEFAULT_MAX_CONSECUTIVE_MISSES
     if rechain_affected_only is None:
         rechain_affected_only = DEFAULT_RECHAIN_AFFECTED_ONLY
+    if recover_long_gaps is None:
+        recover_long_gaps = DEFAULT_RECOVER_LONG_GAPS
+    if min_gap_recovery_frames is None:
+        min_gap_recovery_frames = DEFAULT_MIN_GAP_RECOVERY_FRAMES
+    if final_jump_pass is None:
+        final_jump_pass = DEFAULT_FINAL_JUMP_PASS
+    if tag_size_mm is None:
+        tag_size_mm = DEFAULT_TAG_SIZE_MM
 
     try:
         frame_data = pd.read_pickle(pkl_path)
@@ -1185,6 +1344,25 @@ def _clean_one_pickle(
                     f"(filtered to {len(undecoded_df)} undecoded boxes)"
                 )
 
+        # Resolve output_path up-front so debug snapshots land in the
+        # same directory.  When --output is set, the dir is the parent
+        # of that path; otherwise it's tracking/clean_data next to the
+        # input pickle.
+        if output_path is None:
+            clean_dir = _tracking_layout(_recording_dir_for_pickle(pkl_path))[
+                "clean_data"
+            ]
+            os.makedirs(clean_dir, exist_ok=True)
+            stem = os.path.splitext(os.path.basename(pkl_path))[0]
+            output_path = os.path.join(clean_dir, f"{stem}_clean.pkl")
+
+        debug_snapshot_dir: str | None = None
+        if debug_snapshots:
+            stem = os.path.splitext(os.path.basename(output_path))[0]
+            debug_snapshot_dir = os.path.join(
+                os.path.dirname(output_path), f"{stem}_snapshots"
+            )
+
         cleaned, _id_list, metrics = clean_tracking_data(
             frame_data,
             min_detections=min_detections,
@@ -1195,16 +1373,24 @@ def _clean_one_pickle(
             snap_multiplier=snap_multiplier,
             max_consecutive_misses=max_consecutive_misses,
             rechain_affected_only=rechain_affected_only,
+            recover_long_gaps=recover_long_gaps,
+            min_gap_recovery_frames=min_gap_recovery_frames,
+            final_jump_pass=final_jump_pass,
+            tag_size_mm=tag_size_mm,
+            debug_snapshot_dir=debug_snapshot_dir,
         )
-        if output_path is None:
-            clean_dir = _tracking_layout(_recording_dir_for_pickle(pkl_path))[
-                "clean_data"
-            ]
-            os.makedirs(clean_dir, exist_ok=True)
-            stem = os.path.splitext(os.path.basename(pkl_path))[0]
-            output_path = os.path.join(clean_dir, f"{stem}_clean.pkl")
+        if debug_snapshot_dir is not None:
+            print(f"Debug snapshots: {debug_snapshot_dir}")
         cleaned.to_pickle(output_path)
         print(f"Cleaned: {output_path}")
+        _mm_per_px = cleaned.attrs.get("yoto_mm_per_px", float("nan"))
+        _side_px = cleaned.attrs.get("yoto_median_tag_side_px", float("nan"))
+        _n_scale = cleaned.attrs.get("yoto_scale_sample_count", 0)
+        if _n_scale:
+            print(
+                f"  scale: {_mm_per_px:.5f} mm/px "
+                f"(median tag side {_side_px:.2f} px, n={_n_scale})"
+            )
         if write_csv:
             clean_csv = os.path.splitext(output_path)[0] + ".csv"
             _write_csv(cleaned, clean_csv)
@@ -1222,6 +1408,8 @@ def _clean_one_pickle(
             f"({metrics['yolo_inferred_pct_of_gaps']:.2f}% of gaps) | "
             f"pruned={metrics['yolo_pruned_count']} | "
             f"rechained={metrics['yolo_rechained_count']} | "
+            f"recovered={metrics['long_gap_recovered_count']} | "
+            f"final_jump_del={metrics['final_jump_deleted_count']} | "
             f"snap_threshold={metrics['snap_threshold_px']:.1f}px"
         )
         return (pkl_path, None)
@@ -1289,6 +1477,11 @@ def _run_clean(args: argparse.Namespace) -> None:
             snap_multiplier=args.snap_multiplier,
             max_consecutive_misses=args.max_consecutive_misses,
             rechain_affected_only=args.rechain_affected_only,
+            recover_long_gaps=args.recover_long_gaps,
+            min_gap_recovery_frames=args.min_gap_recovery_frames,
+            final_jump_pass=args.final_jump_pass,
+            tag_size_mm=args.tag_size,
+            debug_snapshots=args.debug_snapshots,
         )
         if result[1] is not None:
             logging.getLogger(__name__).error(
@@ -1402,6 +1595,34 @@ def _add_render_parser(subparsers: argparse._SubParsersAction) -> None:
         "playback; 'hevc' for smaller files.",
     )
     p.add_argument(
+        "--highlight-ids",
+        nargs="+",
+        default=None,
+        metavar="IDS",
+        help="Tag ID(s) to visually highlight in the overlay. Accepts "
+        "space-separated (--highlight-ids 42 87 103), comma-separated "
+        "(--highlight-ids 42,87,103), or any mix (--highlight-ids "
+        "42,87 103). Highlighted tags get the --highlight-color label "
+        "and, when --highlight-bold True, a thicker label stroke.",
+    )
+    p.add_argument(
+        "--highlight-color",
+        default="red",
+        metavar="NAME_OR_RGB",
+        help="Color for highlighted tag labels. Either a named color "
+        "(red, green, blue, yellow, cyan, magenta, white, black) or a "
+        "comma-separated 'R,G,B' triple in 0-255 (default: red).",
+    )
+    p.add_argument(
+        "--highlight-bold",
+        type=_str_to_bool,
+        default=True,
+        metavar="BOOL",
+        help="Draw highlighted tag labels with a thicker stroke "
+        "(default: True). Set False to keep normal weight and change "
+        "only the color.",
+    )
+    p.add_argument(
         "--parallel",
         type=int,
         default=None,
@@ -1433,6 +1654,9 @@ def _render_single_video(
     overlay_quads: bool = False,
     overlay_undecoded: bool = False,
     debug: bool = False,
+    highlight_ids: set[int] | None = None,
+    highlight_color: tuple[int, int, int] = (0, 0, 255),
+    highlight_bold: bool = True,
 ) -> tuple[str, str | None]:
     """Render one video. Returns ``(vpath, None)`` on success, or
     ``(vpath, traceback_text)`` on failure."""
@@ -1565,6 +1789,9 @@ def _render_single_video(
             undecoded_data=undecoded_data,
             debug=debug,
             yolo_data=yolo_data,
+            highlight_ids=highlight_ids,
+            highlight_color=highlight_color,
+            highlight_bold=highlight_bold,
         )
         print(f"Output: {output}")
         return (vpath, None)
@@ -1576,6 +1803,12 @@ def _run_render(args: argparse.Namespace) -> None:
     """Execute the render sub-command."""
     _configure_logging(False)
     args.dataname = _normalize_dataname(args.dataname)
+
+    highlight_color_bgr = _parse_color_bgr(args.highlight_color)
+    highlight_ids_list = _parse_id_list(args.highlight_ids)
+    highlight_ids_set: set[int] | None = (
+        set(highlight_ids_list) if highlight_ids_list else None
+    )
 
     video_paths = _resolve_video_paths(args.video_path)
     if not video_paths:
@@ -1639,6 +1872,12 @@ def _run_render(args: argparse.Namespace) -> None:
             worker_tmpl.append("--undecoded")
         if args.debug:
             worker_tmpl.append("--debug")
+        if highlight_ids_list:
+            worker_tmpl.extend(
+                ["--highlight-ids", ",".join(str(i) for i in highlight_ids_list)]
+            )
+        worker_tmpl.extend(["--highlight-color", args.highlight_color])
+        worker_tmpl.extend(["--highlight-bold", str(args.highlight_bold)])
         input_root = (
             args.video_path
             if os.path.isdir(args.video_path)
@@ -1668,6 +1907,9 @@ def _run_render(args: argparse.Namespace) -> None:
                 overlay_quads=args.quads,
                 overlay_undecoded=args.undecoded,
                 debug=args.debug,
+                highlight_ids=highlight_ids_set,
+                highlight_color=highlight_color_bgr,
+                highlight_bold=args.highlight_bold,
             )
             if result[1] is not None:
                 logging.getLogger(__name__).error(

@@ -21,6 +21,11 @@ In a reference benchmark, 7 days of 10 fps 4512×4512 footage of 100 clonal raid
 - **GPU end-to-end**: NVDEC decode → YOLO inference → AprilTag → NVENC encode; threaded ffmpeg render ~2–3× faster than single-threaded `cv2.VideoWriter`
 - **AprilTag presets**: swap detection / image-processing parameters non-destructively via `--apriltag-preset` (built-in `ir` preset, plus support for any JSON file including Optuna `best_params*.json` dumps)
 - **Two detection backends**: portable simple mode (any CUDA box) and NVDEC-accelerated fast mode for production runs
+- **Configurable tag family**: `yoto detect --tag-family` swaps the AprilTag family (default `tag36ARTag`) without recompiling the C decoder
+- **YOLO-fill gap recovery**: undecoded YOLO boxes are stitched into each tag's trajectory via a forward+backward chain matcher with collision resolution — recovers tag positions on frames where AprilTag failed to decode
+- **Auto px→mm calibration**: `yoto clean --tag-size` measures the median AprilTag side length from decoded corners and stores a `mm_per_px` scale on the clean pickle
+- **Self-describing output**: every clean pickle carries a `df.attrs` block with the YOTO version, all knobs used, per-step counts, and the imaging scale — see [docs/guides/cleaning.md](docs/guides/cleaning.md#pickle-attributes)
+- **Tag highlighting in overlays**: `yoto render --highlight-ids 42,87` calls out specific tags with a bold colored label
 - **Batch processing**: `--parallel N` on `detect` / `render` dispatches one worker per video via GNU parallel, with a live human-readable `progress.txt`
 - **CLI and Python API**: use from the command line or import into your analysis scripts
 
@@ -81,6 +86,7 @@ yoto clean /path/to/recordings/
 yoto render /path/to/experiment.mp4
 yoto render /path/to/recordings/ --scale 0.5 --parallel 3
 yoto render /path/to/recordings/ --raw --no-trails                # raw, uninterpolated
+yoto render /path/to/experiment.mp4 --highlight-ids 42,87,103     # bold red labels for these IDs
 ```
 
 Outputs land in a standard layout next to each video:
@@ -133,7 +139,6 @@ mkdocs build               # static site under ./site/
 
 - Implement a pipeline to semi-automatically retrain the YOLO model and AprilTag presets
 - Document the API for data analysis
-- Auto px→mm calibration: infer the pixel-to-millimetre ratio from known AprilTag physical size and save it as metadata in the output pickle
 
 ## License
 

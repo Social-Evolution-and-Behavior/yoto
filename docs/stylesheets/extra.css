@@ -1,0 +1,13 @@
+/* Pygments' BashLexer matches leading integers (e.g. the "0" in "0.4")
+   as Number tokens, which the Material theme then colors with its
+   accent.  Bash has no float literal, so these reads are spurious
+   wherever we show CLI examples with decimal arguments
+   (--tag-size 0.4, --scale 0.5, etc.).  Restore inherited color
+   inside bash code blocks so the lone "0" stops standing out. */
+.language-bash .m,
+.language-bash .mf,
+.language-bash .mi,
+.language-bash .mh,
+.language-bash .mo {
+  color: inherit;
+}

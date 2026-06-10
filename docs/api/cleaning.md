@@ -5,3 +5,4 @@
       show_source: true
       members:
         - clean_tracking_data
+        - compute_pixel_scale

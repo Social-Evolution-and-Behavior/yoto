@@ -56,9 +56,13 @@ nav:
       - Image Processing: api/image_processing.md
       - Constants: api/constants.md
 
+extra_css:
+  - stylesheets/extra.css
+
 markdown_extensions:
   - pymdownx.highlight:
       anchor_linenums: true
+      pygments_lang_class: true
   - pymdownx.superfences
   - pymdownx.tabbed:
       alternate_style: true

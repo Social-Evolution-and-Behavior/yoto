@@ -13,6 +13,7 @@ from yoto.cleaning import (
     _fill_via_yolo,
     _interpolate_data,
     clean_tracking_data,
+    compute_pixel_scale,
 )
 from yoto.constants import (
     ASS_TYPE_INTERPOLATED,
@@ -22,6 +23,7 @@ from yoto.constants import (
     COL_ASS_TYPE,
     COL_CENTER_X,
     COL_CENTER_Y,
+    COL_CORNERS,
     COL_DISTANCE,
     COL_FRAME,
 )
@@ -127,6 +129,8 @@ class TestCleanTrackingData:
             "yolo_inferred_pct_of_gaps",
             "yolo_pruned_count",
             "yolo_rechained_count",
+            "long_gap_recovered_count",
+            "final_jump_deleted_count",
             "snap_threshold_px",
         }
         assert set(metrics.keys()) == expected_keys
@@ -436,3 +440,76 @@ class TestCleanTrackingDataWithYoloFill:
         # Counters exist and are non-negative.
         assert metrics["yolo_pruned_count"] >= 0
         assert metrics["yolo_rechained_count"] >= 0
+
+
+class TestComputePixelScale:
+    """Tests for compute_pixel_scale."""
+
+    @staticmethod
+    def _square(cx: float, cy: float, side: float) -> np.ndarray:
+        """Return an (lb, rb, rt, lt) corner array for an axis-aligned square."""
+        h = side / 2.0
+        return np.array(
+            [
+                [cx - h, cy - h],  # lb
+                [cx + h, cy - h],  # rb
+                [cx + h, cy + h],  # rt
+                [cx - h, cy + h],  # lt
+            ],
+            dtype=float,
+        )
+
+    def _build_df(
+        self, n_frames: int, tag_ids: list[int], sides: dict[int, float]
+    ) -> pd.DataFrame:
+        index = pd.Index(range(n_frames), name=COL_FRAME)
+        per_tag_frames: dict[tuple[int, str], pd.Series] = {}
+        for tag_id in tag_ids:
+            side = sides[tag_id]
+            per_tag_frames[(tag_id, COL_CENTER_X)] = pd.Series(
+                [100.0] * n_frames, index=index, dtype=float
+            )
+            per_tag_frames[(tag_id, COL_CENTER_Y)] = pd.Series(
+                [100.0] * n_frames, index=index, dtype=float
+            )
+            per_tag_frames[(tag_id, COL_CORNERS)] = pd.Series(
+                [self._square(100.0, 100.0, side) for _ in range(n_frames)],
+                index=index,
+                dtype=object,
+            )
+        df = pd.concat(per_tag_frames, axis=1)
+        df.columns = pd.MultiIndex.from_tuples(
+            df.columns.to_list(), names=["id", "metric"]
+        )
+        return df
+
+    def test_recovers_known_scale(self) -> None:
+        df = self._build_df(20, [1, 2, 3], {1: 50.0, 2: 50.0, 3: 50.0})
+        side_px, mm_per_px, n = compute_pixel_scale(df, tag_size_mm=0.4)
+        assert side_px == pytest.approx(50.0)
+        assert mm_per_px == pytest.approx(0.4 / 50.0)
+        assert n > 0
+
+    def test_robust_to_outlier_id(self) -> None:
+        # One tag with grossly miscalibrated corners shouldn't move the median.
+        df = self._build_df(50, [1, 2, 3], {1: 50.0, 2: 50.0, 3: 500.0})
+        side_px, _, _ = compute_pixel_scale(df, tag_size_mm=0.4)
+        assert side_px == pytest.approx(50.0, rel=0.01)
+
+    def test_returns_nan_when_no_corners(self) -> None:
+        cols = pd.MultiIndex.from_product(
+            [[1], [COL_CENTER_X, COL_CENTER_Y]], names=["id", "metric"]
+        )
+        df = pd.DataFrame({c: [1.0, 2.0] for c in cols})
+        side_px, mm_per_px, n = compute_pixel_scale(df)
+        assert np.isnan(side_px)
+        assert np.isnan(mm_per_px)
+        assert n == 0
+
+    def test_attrs_set_on_clean_output(self) -> None:
+        df = self._build_df(150, [1, 2], {1: 40.0, 2: 40.0})
+        cleaned, _, _ = clean_tracking_data(df, min_detections=1, tag_size_mm=0.4)
+        assert cleaned.attrs["yoto_tag_size_mm"] == 0.4
+        assert cleaned.attrs["yoto_median_tag_side_px"] == pytest.approx(40.0)
+        assert cleaned.attrs["yoto_mm_per_px"] == pytest.approx(0.4 / 40.0)
+        assert cleaned.attrs["yoto_scale_sample_count"] > 0

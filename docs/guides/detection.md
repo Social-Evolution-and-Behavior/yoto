@@ -142,6 +142,8 @@ infrared-illuminated footage; new presets can be dropped into
 | `--pad-ratio` | `0.34` | Per-axis padding added around each YOLO box before cropping (scales with tag size) |
 | `--tag-offset-filter` | `True` | Drop AprilTag decodes whose center is too far from the source YOLO box center — catches misdecodes in padding regions |
 | `--max-tag-offset-ratio` | `0.6` | Distance threshold for `--tag-offset-filter`, as a fraction of `min(box_w, box_h)` |
+| `--tag-family` | `tag36ARTag` | AprilTag family passed to the decoder. Swap to decode a different family (e.g. `tag25h9`, `tag36h11`) without recompiling |
+| `--nms-mode` | `suppress` | Overlap handling. `suppress` = standard NMS (drop lower-conf overlaps); `fuse` replaces each overlap cluster with the union of its boxes — useful when the highest-conf framing isn't always the one that decodes. Fast pipeline only |
 | `--save-yolo` | `True` | Write the `_yolo.pkl` sidecar (disable if not using YOLO-fill in clean) |
 | `--save-quads` | `False` | Write the `_quads.pkl` sidecar (only needed for `render --quads` debug overlay) |
 | `--use-nvdec` | `True` | Use NVDEC hardware decoding (fast pipeline); `False` falls back to the portable Ultralytics pipeline |

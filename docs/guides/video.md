@@ -18,6 +18,13 @@ yoto render /path/to/recordings/ --parallel 3
 
 # Render the raw (uninterpolated) detections
 yoto render /path/to/experiment.mp4 --raw --no-trails
+
+# Highlight specific tags (bold red labels by default).
+# IDs can be space- or comma-separated; both forms can be mixed.
+yoto render /path/to/experiment.mp4 --highlight-ids 42,87,103
+yoto render /path/to/experiment.mp4 --highlight-ids 42 87
+yoto render /path/to/experiment.mp4 --highlight-ids 42 --highlight-color yellow
+yoto render /path/to/experiment.mp4 --highlight-ids 42 --highlight-bold False
 ```
 
 ### Python API
@@ -29,9 +36,12 @@ render_overlay_video(
     "/path/to/experiment.mp4",
     cleaned_dataframe,
     id_list,
-    scale=0.5,        # half-resolution output
-    short=True,       # first 2000 frames only
-    codec="auto",     # "auto" (HEVC first), "hevc", or "h264"
+    scale=0.5,                  # half-resolution output
+    short=True,                 # first 2000 frames only
+    codec="auto",               # "auto" (HEVC first), "hevc", or "h264"
+    highlight_ids={42, 87},     # set / list / iterable of tag IDs
+    highlight_color=(0, 0, 255),  # BGR triple (default: red)
+    highlight_bold=True,        # thicker label stroke for highlighted tags
 )
 ```
 
@@ -39,6 +49,7 @@ render_overlay_video(
 
 - **Per-tag coloured trails** with thickness ramp (thin = old, thick = recent)
 - **Tag ID labels** drawn at each detection position
+- **Tag highlighting** — `--highlight-ids` redraws a subset of labels with a configurable color and an optional bold stroke, useful for calling out individuals of interest in a busy colony
 - **Frame counter** and visible-tag count overlay
 - **3-thread pipeline** (ffmpeg decode → draw → ffmpeg encode) with
   YUV420 pipes — ~2-3× faster than a single-threaded
@@ -46,6 +57,14 @@ render_overlay_video(
 - **GPU-accelerated** decode (`-hwaccel cuda`) and encode
   (`hevc_nvenc` / `h264_nvenc`), with automatic CPU fallbacks
 - **Scalable output** — reduce resolution for quick previews
+
+## Highlight Flags
+
+| Flag | Default | Effect |
+|------|---------|--------|
+| `--highlight-ids` | *(none)* | Tag IDs to highlight. Space- or comma-separated, mixable: `--highlight-ids 42 87`, `--highlight-ids 42,87,103`, `--highlight-ids 42,87 103` |
+| `--highlight-color` | `red` | Label color for highlighted tags. Named (`red`, `green`, `blue`, `yellow`, `cyan`, `magenta`, `white`, `black`) or `R,G,B` triple in 0–255 (e.g. `255,128,0`) |
+| `--highlight-bold` | `True` | Draw highlighted labels with a thicker stroke (~1.6× the regular weight). Set `False` to keep normal weight and change only the color |
 
 ## Architecture
 

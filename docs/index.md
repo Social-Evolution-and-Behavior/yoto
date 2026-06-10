@@ -16,20 +16,25 @@ In a reference benchmark, 7 days of 10 fps 4512×4512 footage of 100 clonal raid
 - **GPU end-to-end**: NVDEC decode → TensorRT / ONNX YOLO inference → AprilTag → NVENC encode; threaded ffmpeg render ~2–3× faster than single-threaded `cv2.VideoWriter`
 - **AprilTag presets**: swap detection / image-processing parameters non-destructively via `--apriltag-preset` (built-in `ir` preset, plus support for any JSON file including Optuna `best_params*.json` dumps)
 - **Two detection backends**: portable simple mode (any CUDA box) and NVDEC-accelerated fast mode for production runs
+- **Configurable tag family**: `yoto detect --tag-family` swaps the AprilTag family (default `tag36ARTag`) without recompiling the C decoder
+- **YOLO-fill gap recovery**: undecoded YOLO boxes are stitched into each tag's trajectory via a forward+backward chain matcher with collision resolution — recovers tag positions on frames where AprilTag failed to decode
+- **Auto px→mm calibration**: `yoto clean --tag-size` measures the median AprilTag side length from decoded corners and stores a `mm_per_px` scale on the clean pickle
+- **Self-describing output**: every clean pickle carries a `df.attrs` block with the YOTO version, all knobs used, per-step counts, and the imaging scale — see [Pickle Attributes](guides/cleaning.md#pickle-attributes)
+- **Tag highlighting in overlays**: `yoto render --highlight-ids 42,87` calls out specific tags with a bold colored label
 - **Batch processing**: `--parallel N` on `detect` / `render` dispatches one worker per video via GNU parallel, with a live human-readable `progress.txt`
 - **CLI and Python API**: use from the command line or import into your analysis scripts
 
 ## Quick Example
 
 ```bash
-# Step 1: Detect tags (NVDEC fast pipeline + TensorRT engine)
-yoto detect /path/to/recording --yoloweights /path/to/yolo.pt --fast --parallel 5
+# Step 1: Detect tags (NVDEC fast pipeline is the default)
+yoto detect /path/to/recording --yoloweights /path/to/yolo.pt --parallel 5
 
-# Step 2: Clean and interpolate the raw tracking data
-yoto clean /path/to/recording
+# Step 2: Clean and interpolate the raw tracking data (auto px→mm calibration)
+yoto clean /path/to/recording --tag-size 0.4
 
-# Step 3: Render the overlay video
-yoto render /path/to/recording --short --scale 0.5
+# Step 3: Render the overlay video, highlighting two tags of interest
+yoto render /path/to/recording --short --scale 0.5 --highlight-ids 42,87
 ```
 
 You can also point any of the commands at a recording directory or a tree of recordings; see the [Quickstart](guides/quickstart.md) for details.

@@ -447,6 +447,9 @@ def render_overlay_video(
     undecoded_data: pd.DataFrame | None = None,
     debug: bool = False,
     yolo_data: pd.DataFrame | None = None,
+    highlight_ids: set[int] | None = None,
+    highlight_color: tuple[int, int, int] = (0, 0, 255),
+    highlight_bold: bool = True,
 ) -> str:
     """Render a video with tracking overlays via a 3-thread pipeline.
 
@@ -642,6 +645,12 @@ def render_overlay_video(
 
     text_scale = max(1.0, 3 * scale) * text_scale_factor
     text_thick = max(1, int(12 * scale * text_scale_factor))
+    highlight_thick = (
+        max(text_thick + 1, int(round(text_thick * 1.6)))
+        if highlight_bold
+        else text_thick
+    )
+    highlight_set = set(highlight_ids) if highlight_ids else set()
 
     from yoto._progress import make_status_updater
 
@@ -711,14 +720,17 @@ def render_overlay_video(
                     x = cx[fn, i] if fn <= max_frame else np.nan
                     y = cy[fn, i] if fn <= max_frame else np.nan
                     if not np.isnan(x):
+                        is_highlight = int(tag_id) in highlight_set
+                        label_color = highlight_color if is_highlight else (0, 0, 0)
+                        label_thick = highlight_thick if is_highlight else text_thick
                         cv2.putText(
                             frame,
                             str(tag_id),
                             (int(x) + int(40 * scale), int(y) + int(40 * scale)),
                             cv2.FONT_HERSHEY_SIMPLEX,
                             text_scale,
-                            (0, 0, 0),
-                            text_thick,
+                            label_color,
+                            label_thick,
                             cv2.LINE_AA,
                         )
 

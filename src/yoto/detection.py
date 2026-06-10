@@ -1198,6 +1198,7 @@ def run_detection_simple(
     preset: str | None = None,
     save_yolo: bool = True,
     save_quads: bool = False,
+    tag_family: str = DEFAULT_TAG_FAMILY,
 ) -> pd.DataFrame:
     """Run the simple (portable) YOLO + AprilTag detection pipeline.
 
@@ -1266,7 +1267,7 @@ def run_detection_simple(
     except Exception as exc:
         raise ModelLoadError(yolo_weights, str(exc)) from exc
 
-    detector = _create_detector(apriltag_params)
+    detector = _create_detector(apriltag_params, family=tag_family)
 
     results = seg_model.predict(
         source=video_path,
@@ -1394,6 +1395,7 @@ def run_detection_fast(
     nms_mode: str = "suppress",
     save_yolo: bool = True,
     save_quads: bool = False,
+    tag_family: str = DEFAULT_TAG_FAMILY,
 ) -> pd.DataFrame:
     """Run the fast (NVDEC) YOLO + AprilTag detection pipeline.
 
@@ -1485,7 +1487,7 @@ def run_detection_fast(
     except Exception as exc:
         raise ModelLoadError(yolo_weights, str(exc)) from exc
 
-    detector = _create_detector(apriltag_params)
+    detector = _create_detector(apriltag_params, family=tag_family)
 
     debug_frame_limit = 500
 

@@ -161,6 +161,34 @@ DEFAULT_RECHAIN_AFFECTED_ONLY: bool = False
 #: detection is considered a tracking jump and deleted.
 DEFAULT_MAX_JUMP_DISTANCE: float = 100.0
 
+#: Experimental: run a "long-gap recovery" sweep after final interpolation.
+#: For each tag with a NaN gap longer than
+#: ``DEFAULT_MIN_GAP_RECOVERY_FRAMES``, snap each gap frame to the closest
+#: unclaimed YOLO box within ``snap_threshold * snap_multiplier`` of the
+#: gap's leading OR trailing anchor (anchors are *fixed* — they don't
+#: drift).  Targets the "temporarily dirty AprilTag on a stopped ant"
+#: failure mode.  Off by default.
+DEFAULT_RECOVER_LONG_GAPS: bool = False
+
+#: Minimum gap length (frames) for the long-gap recovery sweep.
+DEFAULT_MIN_GAP_RECOVERY_FRAMES: int = 10
+
+#: Experimental: run one additional ``_delete_jump_blocks`` pass at the
+#: very end of cleaning (after step 7 / optional gap recovery).  Off by
+#: default — there as a safety net for A/B comparisons.
+DEFAULT_FINAL_JUMP_PASS: bool = False
+
+#: Physical side length of a single AprilTag border, in millimetres.
+#: Used by :func:`yoto.cleaning.compute_pixel_scale` to convert the
+#: median measured tag-side length (px) into a ``mm_per_px`` scale.
+DEFAULT_TAG_SIZE_MM: float = 0.4
+
+#: Target total number of tag corners to sample when measuring scale.
+#: Stratified across all tag IDs and evenly spread in time within each
+#: ID, so the median is robust to both ID-specific bias and temporal
+#: drift (e.g. focus / camera-height changes mid-recording).
+DEFAULT_SCALE_SAMPLE_SIZE: int = 5000
+
 # ---------------------------------------------------------------------------
 # Tag ID filtering
 # ---------------------------------------------------------------------------

@@ -16,6 +16,9 @@ yoto detect /path/to/experiment.mp4 --yoloweights /path/to/yolo.pt --use-nvdec F
 # Apply an AprilTag preset (built-in name, or path to a JSON file)
 yoto detect /path/to/experiment.mp4 --yoloweights /path/to/yolo.pt --apriltag-preset ir
 yoto detect /path/to/experiment.mp4 --yoloweights /path/to/yolo.pt --apriltag-preset /path/to/best_params.json
+
+# Decode a different AprilTag family (default is tag36ARTag)
+yoto detect /path/to/experiment.mp4 --yoloweights /path/to/yolo.pt --tag-family tag25h9
 ```
 
 See [Detection → AprilTag Presets](detection.md#apriltag-presets) for the
@@ -27,13 +30,25 @@ full list of recognised keys and how to add your own preset.
 # Pass either the video, the raw pickle, or the recording directory.
 yoto clean /path/to/experiment.mp4
 yoto clean /path/to/recordings/
+
+# Compute and store an mm/px scale (one tag border = 0.4 mm by default).
+yoto clean /path/to/experiment.mp4 --tag-size 0.4
 ```
+
+The clean pickle's `df.attrs["yoto_mm_per_px"]` lets you convert pixel
+distances to millimetres. See
+[Cleaning → Pickle Attributes](cleaning.md#pickle-attributes) for the
+full list of metadata stamped on the output.
 
 ### 3. Render the overlay video
 
 ```bash
 yoto render /path/to/experiment.mp4
 yoto render /path/to/experiment.mp4 --scale 0.5 --codec h264
+
+# Highlight specific tags (bold red labels). Space- or comma-separated.
+yoto render /path/to/experiment.mp4 --highlight-ids 42,87,103
+yoto render /path/to/experiment.mp4 --highlight-ids 42 --highlight-color yellow
 ```
 
 ### 4. Batch process an entire experiment
