@@ -134,7 +134,7 @@ class TestReprojectTags:
         # (100, 200).  Original YOLO box: 30 px wide × 25 px tall
         # centred at frame (130, 225) — i.e. matches the tag center
         # below so the box-offset check passes trivially.
-        crops = [np.zeros((50, 60), dtype=np.uint8)]
+        crop_shapes = [(50, 60)]
         canvas_x_offsets = [0]
         offsets_xy = [(100, 200)]
         boxes_np = np.array([[115.0, 213.0, 145.0, 238.0]], dtype=np.float64)
@@ -151,7 +151,7 @@ class TestReprojectTags:
         ]
 
         decoded = _reproject_tags(
-            tags, crops, canvas_x_offsets, offsets_xy, boxes_np, frame_dict
+            tags, crop_shapes, canvas_x_offsets, offsets_xy, boxes_np, frame_dict
         )
 
         assert decoded == {0: 5}
@@ -163,7 +163,7 @@ class TestReprojectTags:
         assert frame_dict[(5, COL_CENTER_Y)] == pytest.approx(225.0)
 
     def test_tag_above_max_id_ignored(self) -> None:
-        crops = [np.zeros((50, 60), dtype=np.uint8)]
+        crop_shapes = [(50, 60)]
         canvas_x_offsets = [0]
         offsets_xy = [(0, 0)]
         boxes_np = np.array([[0.0, 0.0, 60.0, 50.0]], dtype=np.float64)
@@ -180,7 +180,7 @@ class TestReprojectTags:
         ]
 
         decoded = _reproject_tags(
-            tags, crops, canvas_x_offsets, offsets_xy, boxes_np, frame_dict
+            tags, crop_shapes, canvas_x_offsets, offsets_xy, boxes_np, frame_dict
         )
         assert decoded == {}
         assert len(frame_dict) == 0
@@ -192,7 +192,7 @@ class TestReprojectTags:
         # composite-center is (5, 5) → frame (95, 195), which is
         # sqrt(25**2 + 25**2) ≈ 35 px from the box center.  Should be
         # rejected.
-        crops = [np.zeros((60, 60), dtype=np.uint8)]
+        crop_shapes = [(60, 60)]
         canvas_x_offsets = [0]
         offsets_xy = [(90, 190)]
         boxes_np = np.array([[100.0, 200.0, 140.0, 240.0]], dtype=np.float64)
@@ -209,7 +209,7 @@ class TestReprojectTags:
         ]
 
         decoded = _reproject_tags(
-            tags, crops, canvas_x_offsets, offsets_xy, boxes_np, frame_dict
+            tags, crop_shapes, canvas_x_offsets, offsets_xy, boxes_np, frame_dict
         )
         assert decoded == {}
         assert len(frame_dict) == 0
@@ -217,7 +217,7 @@ class TestReprojectTags:
     def test_tag_near_box_center_accepted(self) -> None:
         # Same setup but tag at composite-center (30, 30) → frame (120, 220),
         # exactly the box center.
-        crops = [np.zeros((60, 60), dtype=np.uint8)]
+        crop_shapes = [(60, 60)]
         canvas_x_offsets = [0]
         offsets_xy = [(90, 190)]
         boxes_np = np.array([[100.0, 200.0, 140.0, 240.0]], dtype=np.float64)
@@ -234,7 +234,7 @@ class TestReprojectTags:
         ]
 
         decoded = _reproject_tags(
-            tags, crops, canvas_x_offsets, offsets_xy, boxes_np, frame_dict
+            tags, crop_shapes, canvas_x_offsets, offsets_xy, boxes_np, frame_dict
         )
         assert decoded == {0: 7}
         assert frame_dict[(7, COL_CENTER_X)] == pytest.approx(120.0)

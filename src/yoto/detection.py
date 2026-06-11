@@ -70,6 +70,7 @@ from yoto.constants import (
     FAST_UNSHARP_KERNEL,
     FAST_UNSHARP_SIGMA,
     MAX_VALID_TAG_ID,
+    default_max_tag_id_for_family,
 )
 from yoto.exceptions import ModelLoadError
 from yoto.image_processing import (
@@ -152,6 +153,63 @@ def _create_detector(
     )
 
 
+def _compute_crop_layout(
+    boxes_np: BBoxArray,
+    frame_h: int,
+    frame_w: int,
+    pad_ratio: float,
+) -> tuple[
+    list[tuple[int, int, int, int]],
+    list[tuple[int, int]],
+    list[int],
+    tuple[int, int],
+]:
+    """Per-box clamped crop bounds + horizontal-strip composite layout.
+
+    Pure CPU integer arithmetic — no pixel data.  Shared by the CPU
+    cropper (:func:`_crop_and_pack`) and the GPU compositor
+    (:func:`_build_composite_gpu`).
+
+    Returns
+    -------
+    bounds : list[tuple[int, int, int, int]]
+        Per-box ``(y1, y2, x1, x2)`` clamped to the frame.
+    offsets_xy : list[tuple[int, int]]
+        Per-box ``(x1, y1)`` in original-frame coordinates.
+    canvas_x_offsets : list[int]
+        Per-box starting x in the composite strip.
+    composite_size : tuple[int, int]
+        ``(strip_h, strip_w)``; ``(0, 0)`` when there are no boxes.
+    """
+    bounds: list[tuple[int, int, int, int]] = []
+    offsets_xy: list[tuple[int, int]] = []
+
+    for box in boxes_np:
+        x1, y1, x2, y2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
+        pad_x = int(round(pad_ratio * (x2 - x1)))
+        pad_y = int(round(pad_ratio * (y2 - y1)))
+        x1 = max(0, x1 - pad_x)
+        y1 = max(0, y1 - pad_y)
+        x2 = min(frame_w, x2 + pad_x)
+        y2 = min(frame_h, y2 + pad_y)
+        bounds.append((y1, y2, x1, x2))
+        offsets_xy.append((x1, y1))
+
+    if not bounds:
+        return [], [], [], (0, 0)
+
+    strip_h = max(y2 - y1 for (y1, y2, _, _) in bounds)
+    strip_w = sum(x2 - x1 for (_, _, x1, x2) in bounds)
+
+    canvas_x_offsets: list[int] = []
+    cursor = 0
+    for _, _, x1, x2 in bounds:
+        canvas_x_offsets.append(cursor)
+        cursor += x2 - x1
+
+    return bounds, offsets_xy, canvas_x_offsets, (strip_h, strip_w)
+
+
 def _crop_and_pack(
     frame: ImageType,
     boxes_np: BBoxArray,
@@ -164,18 +222,6 @@ def _crop_and_pack(
 ]:
     """Crop detected regions and pack them into a single wide strip.
 
-    Parameters
-    ----------
-    frame : Image
-        Full video frame (grayscale or BGR).
-    boxes_np : BBoxArray
-        YOLO bounding boxes in ``xyxy`` format, shape ``(N, 4)``.
-    pad_ratio : float
-        Per-axis padding ratio.  Each side grows by ``pad_ratio * w`` in
-        x and ``pad_ratio * h`` in y, where ``w`` and ``h`` are this
-        box's own width and height.  Scales padding with tag size, so
-        the same value works across camera heights.
-
     Returns
     -------
     tuple
@@ -183,42 +229,26 @@ def _crop_and_pack(
         *composite_gray* is ``None`` when there are no detections.
     """
     frame_height, frame_width = frame.shape[:2]
-    crops: list[np.ndarray[Any, np.dtype[np.uint8]]] = []
-    offsets_xy: list[tuple[int, int]] = []
+    bounds, offsets_xy, canvas_x_offsets, composite_size = _compute_crop_layout(
+        boxes_np, frame_height, frame_width, pad_ratio
+    )
 
-    for box in boxes_np:
-        x1, y1, x2, y2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
-        pad_x = int(round(pad_ratio * (x2 - x1)))
-        pad_y = int(round(pad_ratio * (y2 - y1)))
-        x1 = max(0, x1 - pad_x)
-        y1 = max(0, y1 - pad_y)
-        x2 = min(frame_width, x2 + pad_x)
-        y2 = min(frame_height, y2 + pad_y)
-        crops.append(frame[y1:y2, x1:x2])
-        offsets_xy.append((x1, y1))
+    if not bounds:
+        return [], offsets_xy, None, []
 
-    if not crops:
-        return crops, offsets_xy, None, []
+    crops = [frame[y1:y2, x1:x2] for (y1, y2, x1, x2) in bounds]
 
-    # Pack into a horizontal strip
-    strip_height = max(c.shape[0] for c in crops)
-    strip_width = sum(c.shape[1] for c in crops)
+    strip_h, strip_w = composite_size
     is_gray = frame.ndim == 2
-
     if is_gray:
-        composite = np.zeros((strip_height, strip_width), dtype=np.uint8)
+        composite = np.zeros((strip_h, strip_w), dtype=np.uint8)
     else:
-        composite = np.zeros((strip_height, strip_width, 3), dtype=np.uint8)
+        composite = np.zeros((strip_h, strip_w, 3), dtype=np.uint8)
 
-    x_cursor = 0
-    canvas_x_offsets: list[int] = []
-    for crop in crops:
+    for crop, dst_x in zip(crops, canvas_x_offsets):
         h, w = crop.shape[:2]
-        composite[0:h, x_cursor : x_cursor + w] = crop
-        canvas_x_offsets.append(x_cursor)
-        x_cursor += w
+        composite[0:h, dst_x : dst_x + w] = crop
 
-    # Convert to grayscale for AprilTag
     if is_gray:
         composite_gray = composite
     else:
@@ -344,12 +374,14 @@ def _enhance_and_detect(
 
 def _reproject_tags(
     tags: list[dict[str, Any]],
-    crops: list[np.ndarray[Any, np.dtype[np.uint8]]],
+    crop_shapes: list[tuple[int, int]],
     canvas_x_offsets: list[int],
     offsets_xy: list[tuple[int, int]],
     boxes_np: BBoxArray,
     frame_dict: dict[tuple[Any, str], Any],
     max_offset_ratio: float = DEFAULT_MAX_TAG_OFFSET_RATIO,
+    max_tag_id: int = MAX_VALID_TAG_ID,
+    silence_ids: np.ndarray[Any, np.dtype[np.int64]] | None = None,
 ) -> dict[int, int]:
     """Map tag coordinates from the composite strip back to the full frame.
 
@@ -358,7 +390,7 @@ def _reproject_tags(
     full-frame coordinates, and stamp them into ``frame_dict``.
 
     Reject the tag (don't stamp anything) if:
-      * ``tag_id > MAX_VALID_TAG_ID`` — outside the family range.
+      * ``tag_id > max_tag_id`` — outside the family range.
       * The reprojected center is farther from the source YOLO box's
         center than ``max_offset_ratio * min(box_w, box_h)``.  This
         catches AprilTag misdecodes that lock onto a quad in the
@@ -391,11 +423,11 @@ def _reproject_tags(
         downstream to (a) filter raw quads and (b) stamp ``tag_id`` /
         ``decoded`` columns on the ``_yolo.pkl`` sidecar.
     """
-    if not tags or not crops:
+    if not tags or not crop_shapes:
         return {}
 
-    n_crops = len(crops)
-    cum_widths = np.cumsum([c.shape[1] for c in crops])
+    n_crops = len(crop_shapes)
+    cum_widths = np.cumsum([s[1] for s in crop_shapes])
 
     # Stack the tag list into numpy arrays once.  Everything that's a
     # uniform per-tag scalar (center, id) becomes a vector; everything
@@ -412,7 +444,9 @@ def _reproject_tags(
     # in the valid family range.  Out-of-bounds indices get clamped to
     # 0 for safe array lookups below — their ``valid`` slot stays False
     # so they never reach ``frame_dict``.
-    valid = (crop_idxs < n_crops) & (tag_ids_arr <= MAX_VALID_TAG_ID)
+    valid = (crop_idxs < n_crops) & (tag_ids_arr <= max_tag_id)
+    if silence_ids is not None and silence_ids.size:
+        valid &= ~np.isin(tag_ids_arr, silence_ids)
     if not valid.any():
         return {}
     safe_idxs = np.where(valid, crop_idxs, 0)
@@ -471,7 +505,7 @@ def _reproject_tags(
 def _filter_and_reproject_quads(
     raw_quads: list[np.ndarray[Any, np.dtype[np.float64]]],
     decoded_crops: set[int] | dict[int, int],
-    crops: list[np.ndarray[Any, np.dtype[np.uint8]]],
+    crop_shapes: list[tuple[int, int]],
     cum_widths: np.ndarray[Any, np.dtype[np.int64]],
     canvas_x_offsets: list[int],
     offsets_xy: list[tuple[int, int]],
@@ -483,14 +517,14 @@ def _filter_and_reproject_quads(
     crop and (b) exactly one quad fell inside it — both conditions
     keep ambiguous cases out of downstream cleaning.
     """
-    if not raw_quads or not crops:
+    if not raw_quads or not crop_shapes:
         return []
 
     by_crop: dict[int, list[np.ndarray[Any, np.dtype[np.float64]]]] = {}
     for q in raw_quads:
         qcx = float(q[:, 0].mean())
         idx = int(np.searchsorted(cum_widths, qcx, side="right"))
-        if idx >= len(crops):
+        if idx >= len(crop_shapes):
             continue
         by_crop.setdefault(idx, []).append(q)
 
@@ -564,6 +598,8 @@ def _process_frame_cpu(
     detector: Any,
     confs_np: np.ndarray[Any, np.dtype[np.float32]] | None = None,
     max_offset_ratio: float = DEFAULT_MAX_TAG_OFFSET_RATIO,
+    max_tag_id: int = MAX_VALID_TAG_ID,
+    silence_ids: np.ndarray[Any, np.dtype[np.int64]] | None = None,
     save_yolo: bool = True,
     save_quads: bool = False,
 ) -> tuple[
@@ -599,23 +635,93 @@ def _process_frame_cpu(
     tags, raw_quads = _enhance_and_detect(
         composite_gray, apriltag_params, detector, save_quads=save_quads
     )
+    crop_shapes = [c.shape[:2] for c in crops]
     decoded_tag_ids = _reproject_tags(
         tags,
-        crops,
+        crop_shapes,
         canvas_x_offsets,
         offsets_xy,
         boxes_np,
         frame_dict,
         max_offset_ratio=max_offset_ratio,
+        max_tag_id=max_tag_id,
+        silence_ids=silence_ids,
     )
 
     quad_rows: list[dict[str, Any]] = []
     if save_quads:
-        cum_widths = np.cumsum([c.shape[1] for c in crops])
+        cum_widths = np.cumsum([w for (_, w) in crop_shapes])
         quad_rows = _filter_and_reproject_quads(
             raw_quads,
             decoded_tag_ids,
-            crops,
+            crop_shapes,
+            cum_widths,
+            canvas_x_offsets,
+            offsets_xy,
+            frame_idx,
+        )
+
+    all_yolo_rows: list[dict[str, Any]] = []
+    if save_yolo:
+        all_yolo_rows = _collect_all_yolo_boxes(
+            boxes_np, confs_np, decoded_tag_ids, frame_idx
+        )
+
+    return frame_dict, quad_rows, all_yolo_rows
+
+
+def _process_frame_precomposited(
+    frame_idx: int,
+    composite_gray: np.ndarray[Any, np.dtype[np.uint8]] | None,
+    crop_shapes: list[tuple[int, int]],
+    offsets_xy: list[tuple[int, int]],
+    canvas_x_offsets: list[int],
+    boxes_np: BBoxArray,
+    apriltag_params: dict[str, Any],
+    detector: Any,
+    confs_np: np.ndarray[Any, np.dtype[np.float32]] | None = None,
+    max_offset_ratio: float = DEFAULT_MAX_TAG_OFFSET_RATIO,
+    max_tag_id: int = MAX_VALID_TAG_ID,
+    silence_ids: np.ndarray[Any, np.dtype[np.int64]] | None = None,
+    save_yolo: bool = True,
+    save_quads: bool = False,
+) -> tuple[
+    dict[tuple[Any, str], Any],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+]:
+    """CPU-side work for one frame whose composite was already built on GPU.
+
+    Same outputs as :func:`_process_frame_cpu`; skips :func:`_crop_and_pack`
+    because the composite and layout metadata are precomputed upstream.
+    """
+    frame_dict: dict[tuple[Any, str], Any] = {(COL_FRAME, ""): frame_idx}
+
+    if composite_gray is None:
+        return frame_dict, [], []
+
+    tags, raw_quads = _enhance_and_detect(
+        composite_gray, apriltag_params, detector, save_quads=save_quads
+    )
+    decoded_tag_ids = _reproject_tags(
+        tags,
+        crop_shapes,
+        canvas_x_offsets,
+        offsets_xy,
+        boxes_np,
+        frame_dict,
+        max_offset_ratio=max_offset_ratio,
+        max_tag_id=max_tag_id,
+        silence_ids=silence_ids,
+    )
+
+    quad_rows: list[dict[str, Any]] = []
+    if save_quads:
+        cum_widths = np.cumsum([w for (_, w) in crop_shapes])
+        quad_rows = _filter_and_reproject_quads(
+            raw_quads,
+            decoded_tag_ids,
+            crop_shapes,
             cum_widths,
             canvas_x_offsets,
             offsets_xy,
@@ -639,22 +745,65 @@ def _process_frame_cpu(
 class _NvdecResult:
     """Minimal stand-in for an Ultralytics ``Results`` object.
 
-    Exposes ``.orig_img`` (NV12 Y plane, grayscale), ``.boxes.xyxy``
-    and ``.boxes.conf`` (CPU torch tensors), and a ``.speed`` dict.
+    Carries the precomputed composite strip (grayscale numpy) plus the
+    layout metadata needed for tag reprojection, the CPU-side YOLO box
+    arrays, and a ``.speed`` dict of per-stage GPU timings.  The fast
+    pipeline now builds the composite on GPU and transfers only that
+    small strip per frame instead of the full Y plane.
     """
 
-    __slots__ = ("orig_img", "boxes", "speed")
+    __slots__ = (
+        "composite",
+        "crop_shapes",
+        "offsets_xy",
+        "canvas_x_offsets",
+        "boxes",
+        "speed",
+    )
 
     def __init__(
         self,
-        orig_img: GrayImage,
-        xyxy: Any,
-        conf: Any,
+        composite: np.ndarray[Any, np.dtype[np.uint8]] | None,
+        crop_shapes: list[tuple[int, int]],
+        offsets_xy: list[tuple[int, int]],
+        canvas_x_offsets: list[int],
+        xyxy: np.ndarray[Any, np.dtype[np.float32]],
+        conf: np.ndarray[Any, np.dtype[np.float32]],
         speed: dict[str, float],
     ) -> None:
-        self.orig_img = orig_img
+        self.composite = composite
+        self.crop_shapes = crop_shapes
+        self.offsets_xy = offsets_xy
+        self.canvas_x_offsets = canvas_x_offsets
         self.boxes = type("_Boxes", (), {"xyxy": xyxy, "conf": conf})()
         self.speed = speed
+
+
+def _build_composite_gpu(
+    y_gpu: Any,
+    bounds: list[tuple[int, int, int, int]],
+    canvas_x_offsets: list[int],
+    composite_size: tuple[int, int],
+) -> Any:
+    """Pack variable-size crops from a GPU Y-plane tensor into one strip.
+
+    Slice-assigns each ``(y1:y2, x1:x2)`` region of ``y_gpu`` into the
+    composite at its ``canvas_x_offsets`` location, with the top of the
+    strip as the anchor (matches the CPU :func:`_crop_and_pack` layout).
+    Returns the GPU composite tensor; caller is responsible for the
+    ``.cpu()`` transfer.
+    """
+    import torch
+
+    strip_h, strip_w = composite_size
+    if strip_h == 0 or strip_w == 0:
+        return None
+    composite = torch.zeros(strip_h, strip_w, dtype=torch.uint8, device=y_gpu.device)
+    for (y1, y2, x1, x2), dst_x in zip(bounds, canvas_x_offsets):
+        h = y2 - y1
+        w = x2 - x1
+        composite[:h, dst_x : dst_x + w] = y_gpu[y1:y2, x1:x2]
+    return composite
 
 
 def _nv12_to_model_input(
@@ -979,6 +1128,7 @@ def _pynvdec_predict(
     conf_thres: float,
     iou_thres: float,
     batch_size: int,
+    pad_ratio: float,
     target_size: int = DEFAULT_TARGET_SIZE,
     max_det: int = DEFAULT_MAX_DETECTIONS,
     nc: int = 1,
@@ -1082,6 +1232,11 @@ def _pynvdec_predict(
             max_det=max_det,
             nc=nc,
         )
+        if debug:
+            torch.cuda.synchronize()
+            t_nms = time.perf_counter() - t0
+            t0 = time.perf_counter()
+
         # Scale boxes back to original frame coordinates
         for dets in nms_out:
             if dets.numel():
@@ -1089,26 +1244,66 @@ def _pynvdec_predict(
                 dets[:, 1] *= scale_y
                 dets[:, 2] *= scale_x
                 dets[:, 3] *= scale_y
-
-        # Copy only the Y plane (grayscale) to CPU for AprilTag
-        y_cpu_list = [t[:frame_h, :].cpu().numpy() for t in nv12s]
         if debug:
-            t_postproc = time.perf_counter() - t0
+            torch.cuda.synchronize()
+            t_box_scale = time.perf_counter() - t0
+            t0 = time.perf_counter()
+
+        # Build per-frame composites on GPU and copy only the strips to CPU.
+        # Drops PCIe traffic from one full Y plane per frame (~20 MB at
+        # 4512^2) to ~max(crop_h) x sum(crop_w) (typically <3 MB).
+        boxes_xyxy_cpu_list = [d[:, :4].cpu().numpy() for d in nms_out]
+        boxes_conf_cpu_list = [d[:, 4].cpu().numpy() for d in nms_out]
+        per_frame_composites: list[np.ndarray[Any, np.dtype[np.uint8]] | None] = []
+        per_frame_crop_shapes: list[list[tuple[int, int]]] = []
+        per_frame_offsets_xy: list[list[tuple[int, int]]] = []
+        per_frame_canvas_x: list[list[int]] = []
+
+        for t, boxes_np in zip(nv12s, boxes_xyxy_cpu_list):
+            bounds, offsets_xy, canvas_x_offsets, composite_size = _compute_crop_layout(
+                boxes_np, frame_h, frame_w, pad_ratio
+            )
+            per_frame_offsets_xy.append(offsets_xy)
+            per_frame_canvas_x.append(canvas_x_offsets)
+            per_frame_crop_shapes.append(
+                [(y2 - y1, x2 - x1) for (y1, y2, x1, x2) in bounds]
+            )
+            if not bounds:
+                per_frame_composites.append(None)
+                continue
+            composite_gpu = _build_composite_gpu(
+                t[:frame_h, :], bounds, canvas_x_offsets, composite_size
+            )
+            per_frame_composites.append(composite_gpu.cpu().numpy())
+
+        if debug:
+            t_y_copy = time.perf_counter() - t0
 
         if debug:
             speed = {
                 "preprocess": (t_decode + t_preproc) * 1000.0 / actual_bs,
                 "inference": t_infer * 1000.0 / actual_bs,
-                "postprocess": t_postproc * 1000.0 / actual_bs,
+                "nms": t_nms * 1000.0 / actual_bs,
+                "box_scale": t_box_scale * 1000.0 / actual_bs,
+                "y_copy": t_y_copy * 1000.0 / actual_bs,
             }
         else:
-            speed = {"preprocess": 0.0, "inference": 0.0, "postprocess": 0.0}
+            speed = {
+                "preprocess": 0.0,
+                "inference": 0.0,
+                "nms": 0.0,
+                "box_scale": 0.0,
+                "y_copy": 0.0,
+            }
 
-        for y_np, dets in zip(y_cpu_list, nms_out):
+        for i in range(actual_bs):
             yield _NvdecResult(
-                y_np,
-                dets[:, :4].cpu(),
-                dets[:, 4].cpu(),
+                per_frame_composites[i],
+                per_frame_crop_shapes[i],
+                per_frame_offsets_xy[i],
+                per_frame_canvas_x[i],
+                boxes_xyxy_cpu_list[i],
+                boxes_conf_cpu_list[i],
                 speed,
             )
             yielded += 1
@@ -1199,6 +1394,8 @@ def run_detection_simple(
     save_yolo: bool = True,
     save_quads: bool = False,
     tag_family: str = DEFAULT_TAG_FAMILY,
+    max_tag_id: int | None = None,
+    silence_ids: list[int] | None = None,
 ) -> pd.DataFrame:
     """Run the simple (portable) YOLO + AprilTag detection pipeline.
 
@@ -1268,6 +1465,9 @@ def run_detection_simple(
         raise ModelLoadError(yolo_weights, str(exc)) from exc
 
     detector = _create_detector(apriltag_params, family=tag_family)
+    if max_tag_id is None:
+        max_tag_id = default_max_tag_id_for_family(tag_family)
+    silence_arr = np.asarray(silence_ids, dtype=np.int64) if silence_ids else None
 
     results = seg_model.predict(
         source=video_path,
@@ -1312,6 +1512,8 @@ def run_detection_simple(
             detector,
             confs_np=confs_np,
             max_offset_ratio=max_offset_ratio,
+            max_tag_id=max_tag_id,
+            silence_ids=silence_arr,
             save_yolo=save_yolo,
             save_quads=save_quads,
         )
@@ -1336,6 +1538,9 @@ def run_detection_simple(
             "yoto_yolo_weights": yolo_weights,
             "yoto_preset": preset,
             "yoto_pad_ratio": pad_ratio,
+            "yoto_tag_family": tag_family,
+            "yoto_max_tag_id": max_tag_id,
+            "yoto_silence_ids": list(silence_ids) if silence_ids else [],
         },
     )
     df.to_pickle(out_pkl)
@@ -1396,6 +1601,8 @@ def run_detection_fast(
     save_yolo: bool = True,
     save_quads: bool = False,
     tag_family: str = DEFAULT_TAG_FAMILY,
+    max_tag_id: int | None = None,
+    silence_ids: list[int] | None = None,
 ) -> pd.DataFrame:
     """Run the fast (NVDEC) YOLO + AprilTag detection pipeline.
 
@@ -1488,6 +1695,9 @@ def run_detection_fast(
         raise ModelLoadError(yolo_weights, str(exc)) from exc
 
     detector = _create_detector(apriltag_params, family=tag_family)
+    if max_tag_id is None:
+        max_tag_id = default_max_tag_id_for_family(tag_family)
+    silence_arr = np.asarray(silence_ids, dtype=np.int64) if silence_ids else None
 
     debug_frame_limit = 500
 
@@ -1497,6 +1707,7 @@ def run_detection_fast(
         conf_thres=conf_threshold,
         iou_thres=iou_threshold,
         batch_size=batch_size,
+        pad_ratio=pad_ratio,
         target_size=target_size,
         max_det=DEFAULT_MAX_DETECTIONS,
         nc=yolo_nc,
@@ -1514,10 +1725,27 @@ def run_detection_fast(
     executor = ThreadPoolExecutor(max_workers=1)
     pending: deque[Any] = deque()
 
+    gpu_ms_pre = 0.0
+    gpu_ms_inf = 0.0
+    gpu_ms_nms = 0.0
+    gpu_ms_box = 0.0
+    gpu_ms_ycopy = 0.0
+    cpu_times: list[float] = []
+    n_profiled = 0
+
+    def _timed_cpu(*a: Any, **kw: Any) -> Any:
+        t0 = time.perf_counter()
+        out = _process_frame_precomposited(*a, **kw)
+        cpu_times.append(time.perf_counter() - t0)
+        return out
+
+    submit_fn = _timed_cpu if debug else _process_frame_precomposited
+
     from yoto._progress import make_status_updater
 
     disable_tqdm = bool(os.environ.get("YOTO_NO_PROGRESS"))
     status_update = make_status_updater(video_path, effective_frames)
+    wall_t0 = time.perf_counter()
     for i, result in enumerate(
         tqdm(
             results,
@@ -1530,23 +1758,31 @@ def run_detection_fast(
         if debug and i >= debug_frame_limit:
             break
 
-        frame = result.orig_img
-        frame_height, frame_width = frame.shape[0], frame.shape[1]
-        boxes_np = result.boxes.xyxy.cpu().numpy()
-        confs_np = result.boxes.conf.cpu().numpy() if save_yolo else None
+        if debug:
+            gpu_ms_pre += result.speed["preprocess"]
+            gpu_ms_inf += result.speed["inference"]
+            gpu_ms_nms += result.speed["nms"]
+            gpu_ms_box += result.speed["box_scale"]
+            gpu_ms_ycopy += result.speed["y_copy"]
+            n_profiled += 1
+
+        boxes_np = result.boxes.xyxy
+        confs_np = result.boxes.conf if save_yolo else None
 
         fut = executor.submit(
-            _process_frame_cpu,
+            submit_fn,
             i,
-            frame,
+            result.composite,
+            result.crop_shapes,
+            result.offsets_xy,
+            result.canvas_x_offsets,
             boxes_np,
-            frame_width,
-            frame_height,
-            pad_ratio,
             apriltag_params,
             detector,
             confs_np,
             max_offset_ratio,
+            max_tag_id,
+            silence_arr,
             save_yolo,
             save_quads,
         )
@@ -1571,7 +1807,45 @@ def run_detection_fast(
         if save_yolo:
             yolo_all.extend(yr)
     executor.shutdown()
+    wall_elapsed = time.perf_counter() - wall_t0
     results.close()
+
+    if debug and n_profiled:
+        n_cpu = max(len(cpu_times), 1)
+        cpu_mean_ms = sum(cpu_times) * 1000.0 / n_cpu
+        gpu_pre_ms = gpu_ms_pre / n_profiled
+        gpu_inf_ms = gpu_ms_inf / n_profiled
+        gpu_nms_ms = gpu_ms_nms / n_profiled
+        gpu_box_ms = gpu_ms_box / n_profiled
+        gpu_ycopy_ms = gpu_ms_ycopy / n_profiled
+        gpu_post_ms = gpu_nms_ms + gpu_box_ms + gpu_ycopy_ms
+        gpu_sum_ms = gpu_pre_ms + gpu_inf_ms + gpu_post_ms
+        observed_fps = n_profiled / wall_elapsed if wall_elapsed > 0 else 0.0
+        logger.info(
+            "\n--- Debug profile (%d frames, %.2fs wall) ---\n"
+            "  GPU decode+preproc:     %6.2f ms/frame\n"
+            "  GPU inference:          %6.2f ms/frame\n"
+            "  GPU postprocess:        %6.2f ms/frame\n"
+            "    - NMS:                %6.2f ms/frame\n"
+            "    - box scale:          %6.2f ms/frame\n"
+            "    - composite+copy:     %6.2f ms/frame\n"
+            "  CPU _process_frame_cpu: %6.2f ms/frame  (max_workers=1)\n"
+            "  Observed throughput:   %7.1f fps\n"
+            "  GPU-stage ceiling:     %7.1f fps  (sum of GPU stages)\n"
+            "  CPU-stage ceiling:     %7.1f fps  (single-threaded AprilTag)\n",
+            n_profiled,
+            wall_elapsed,
+            gpu_pre_ms,
+            gpu_inf_ms,
+            gpu_post_ms,
+            gpu_nms_ms,
+            gpu_box_ms,
+            gpu_ycopy_ms,
+            cpu_mean_ms,
+            observed_fps,
+            1000.0 / max(gpu_sum_ms, 1e-9),
+            1000.0 / max(cpu_mean_ms, 1e-9),
+        )
 
     # Build DataFrame
     df = pd.DataFrame(results_tag)
@@ -1585,6 +1859,9 @@ def run_detection_fast(
             "yoto_yolo_weights": yolo_weights,
             "yoto_preset": preset,
             "yoto_nms_mode": nms_mode,
+            "yoto_tag_family": tag_family,
+            "yoto_max_tag_id": max_tag_id,
+            "yoto_silence_ids": list(silence_ids) if silence_ids else [],
             "yoto_pad_ratio": pad_ratio,
         },
     )

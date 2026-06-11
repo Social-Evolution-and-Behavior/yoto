@@ -193,8 +193,26 @@ DEFAULT_SCALE_SAMPLE_SIZE: int = 5000
 # Tag ID filtering
 # ---------------------------------------------------------------------------
 
-#: Tags with IDs above this value are discarded (family-dependent).
+#: Tags with IDs above this value are discarded when decoding the
+#: default :data:`DEFAULT_TAG_FAMILY` (ARTag).
 MAX_VALID_TAG_ID: int = 237
+
+#: Looser ceiling used for non-ARTag families (e.g. ``tag25h9``,
+#: ``tag36h11``), which have larger valid-ID ranges than ARTag.
+DEFAULT_MAX_TAG_ID_OTHER: int = 999
+
+
+def default_max_tag_id_for_family(family: str) -> int:
+    """Family-aware default for the max-tag-id discard threshold.
+
+    Returns :data:`MAX_VALID_TAG_ID` for the ARTag family
+    (:data:`DEFAULT_TAG_FAMILY`); :data:`DEFAULT_MAX_TAG_ID_OTHER`
+    otherwise.  Override via ``yoto detect --max-tag-id``.
+    """
+    return (
+        MAX_VALID_TAG_ID if family == DEFAULT_TAG_FAMILY else DEFAULT_MAX_TAG_ID_OTHER
+    )
+
 
 # ---------------------------------------------------------------------------
 # Video overlay defaults

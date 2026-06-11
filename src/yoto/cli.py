@@ -93,12 +93,15 @@ _NAMED_COLORS_BGR: dict[str, tuple[int, int, int]] = {
 }
 
 
-def _parse_id_list(tokens: list[str] | None) -> list[int]:
+def _parse_id_list(
+    tokens: list[str] | None, flag_name: str = "--highlight-ids"
+) -> list[int]:
     """Parse a space- or comma-separated list of tag IDs.
 
     argparse hands us ``nargs="+"`` tokens; each token may itself be a
     comma-separated group (``"42,87"``).  Flatten, split, strip, and
-    convert to ``int``.  Empty input returns ``[]``.
+    convert to ``int``.  Empty input returns ``[]``.  ``flag_name`` is
+    used only in error messages so the right flag gets the blame.
     """
     if not tokens:
         return []
@@ -112,7 +115,7 @@ def _parse_id_list(tokens: list[str] | None) -> list[int]:
                 ids.append(int(part))
             except ValueError as exc:
                 raise argparse.ArgumentTypeError(
-                    f"--highlight-ids: expected integer IDs, got {part!r}"
+                    f"{flag_name}: expected integer IDs, got {part!r}"
                 ) from exc
     return ids
 
@@ -392,6 +395,27 @@ def _add_detect_parser(subparsers: argparse._SubParsersAction) -> None:
         "different tag family (e.g. 'tag25h9', 'tag36h11').",
     )
     p.add_argument(
+        "--max-tag-id",
+        type=int,
+        default=None,
+        metavar="N",
+        help=f"Maximum tag ID to keep; decodes with higher IDs are "
+        f"discarded as out-of-family misdecodes. Default depends on "
+        f"--tag-family: 237 for {DEFAULT_TAG_FAMILY!r} (ARTag), 999 for "
+        "any other family.",
+    )
+    p.add_argument(
+        "--silence-ids",
+        nargs="+",
+        default=None,
+        metavar="ID",
+        help="Tag IDs to drop unconditionally (in addition to the "
+        "--max-tag-id cutoff). Use this for IDs known to be prone to "
+        "misdecode in your setup. Space- or comma-separated, mixable: "
+        "'--silence-ids 12 45', '--silence-ids 12,45,67', or "
+        "'--silence-ids 12,45 67'.",
+    )
+    p.add_argument(
         "--conf",
         type=float,
         default=DEFAULT_CONF_THRESHOLD,
@@ -452,6 +476,18 @@ def _add_detect_parser(subparsers: argparse._SubParsersAction) -> None:
         "useful when the highest-conf box framing isn't always the one "
         "that decodes the AprilTag. Fast pipeline only.",
     )
+    from yoto.constants import DEFAULT_BATCH_SIZE
+
+    p.add_argument(
+        "--batch-size",
+        type=int,
+        default=DEFAULT_BATCH_SIZE,
+        metavar="N",
+        help=f"Frames per GPU batch for the fast pipeline "
+        f"(default: {DEFAULT_BATCH_SIZE}). Larger batches amortise NVDEC "
+        "fetch, NMS dispatch and Python overhead but cost more VRAM. "
+        "Ignored when --use-nvdec False.",
+    )
     p.add_argument(
         "--save-yolo",
         type=_str_to_bool,
@@ -493,12 +529,16 @@ def _run_single_video(
     save_yolo: bool = True,
     save_quads: bool = False,
     tag_family: str | None = None,
+    batch_size: int | None = None,
+    max_tag_id: int | None = None,
+    silence_ids: list[int] | None = None,
 ) -> tuple[str, str | None]:
     """Run detection on one video. Returns ``(vpath, None)`` on success,
     or ``(vpath, traceback_text)`` on failure."""
     import traceback
 
     from yoto.constants import (
+        DEFAULT_BATCH_SIZE,
         DEFAULT_CONF_THRESHOLD,
         DEFAULT_IOU_THRESHOLD,
         DEFAULT_MAX_TAG_OFFSET_RATIO,
@@ -516,6 +556,8 @@ def _run_single_video(
         max_tag_offset_ratio = DEFAULT_MAX_TAG_OFFSET_RATIO
     if tag_family is None:
         tag_family = DEFAULT_TAG_FAMILY
+    if batch_size is None:
+        batch_size = DEFAULT_BATCH_SIZE
 
     if output_dir is None:
         output_dir = _tracking_layout(_recording_dir_for_video(vpath))["raw_data"]
@@ -539,6 +581,9 @@ def _run_single_video(
                 save_yolo=save_yolo,
                 save_quads=save_quads,
                 tag_family=tag_family,
+                batch_size=batch_size,
+                max_tag_id=max_tag_id,
+                silence_ids=silence_ids,
             )
         else:
             if nms_mode != "suppress":
@@ -562,6 +607,8 @@ def _run_single_video(
                 save_yolo=save_yolo,
                 save_quads=save_quads,
                 tag_family=tag_family,
+                max_tag_id=max_tag_id,
+                silence_ids=silence_ids,
             )
         return (vpath, None)
     except Exception:
@@ -595,6 +642,13 @@ def _build_worker_cmd(
         cmd.extend(["--max-tag-offset-ratio", str(args.max_tag_offset_ratio)])
     if getattr(args, "tag_family", None):
         cmd.extend(["--tag-family", args.tag_family])
+    if getattr(args, "batch_size", None) is not None:
+        cmd.extend(["--batch-size", str(args.batch_size)])
+    if getattr(args, "max_tag_id", None) is not None:
+        cmd.extend(["--max-tag-id", str(args.max_tag_id)])
+    silence = _parse_id_list(getattr(args, "silence_ids", None), "--silence-ids")
+    if silence:
+        cmd.extend(["--silence-ids", ",".join(str(i) for i in silence)])
     cmd.extend(["--save-yolo", str(args.save_yolo)])
     cmd.extend(["--save-quads", str(args.save_quads)])
     return cmd
@@ -996,6 +1050,14 @@ def _run_detect(args: argparse.Namespace) -> None:
         worker_tmpl.extend(["--pad-ratio", str(args.pad_ratio)])
         worker_tmpl.extend(["--max-tag-offset-ratio", str(args.max_tag_offset_ratio)])
         worker_tmpl.extend(["--tag-family", args.tag_family])
+        worker_tmpl.extend(["--batch-size", str(args.batch_size)])
+        if args.max_tag_id is not None:
+            worker_tmpl.extend(["--max-tag-id", str(args.max_tag_id)])
+        worker_silence = _parse_id_list(args.silence_ids, "--silence-ids")
+        if worker_silence:
+            worker_tmpl.extend(
+                ["--silence-ids", ",".join(str(i) for i in worker_silence)]
+            )
         worker_tmpl.extend(["--save-yolo", str(args.save_yolo)])
         worker_tmpl.extend(["--save-quads", str(args.save_quads)])
         input_root = (
@@ -1030,6 +1092,9 @@ def _run_detect(args: argparse.Namespace) -> None:
                 save_yolo=args.save_yolo,
                 save_quads=args.save_quads,
                 tag_family=args.tag_family,
+                batch_size=args.batch_size,
+                max_tag_id=args.max_tag_id,
+                silence_ids=_parse_id_list(args.silence_ids, "--silence-ids"),
             )
             if result[1] is not None:
                 logging.getLogger(__name__).error(
@@ -1324,6 +1389,17 @@ def _clean_one_pickle(
 
     try:
         frame_data = pd.read_pickle(pkl_path)
+
+        # No detections at all → nothing to clean.  Warn and skip; do not
+        # write a clean pickle (matches user expectation that an empty
+        # raw pickle short-circuits the whole pipeline).
+        if frame_data.empty or frame_data.shape[1] == 0:
+            logging.getLogger(__name__).warning(
+                "No tag detections in %s — skipping (no clean pickle written).",
+                pkl_path,
+            )
+            return (pkl_path, None)
+
         # Write the raw CSV *before* clean_tracking_data, which mutates the
         # input frame in place.
         if write_csv:
