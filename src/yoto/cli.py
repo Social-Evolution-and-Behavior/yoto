@@ -211,13 +211,19 @@ def _resolve_pickle_paths(path: str, data_suffix: str = "") -> list[str]:
     def _is_raw(f: str) -> bool:
         # Exclude sidecars: <stem>_quads.pkl and <stem>_yolo.pkl are
         # produced by `yoto detect` and are not cleanable input.
-        return (
-            not f.startswith(".")
-            and f.endswith(".pkl")
-            and not f.endswith("_clean.pkl")
-            and not f.endswith("_quads.pkl")
-            and not f.endswith("_yolo.pkl")
-        )
+        # When data_suffix is set, also drop pickles from other detect
+        # runs in the same dir (e.g. `_8nNewSet_IR` alongside `_yoto_0.10.x`).
+        if (
+            f.startswith(".")
+            or not f.endswith(".pkl")
+            or f.endswith("_clean.pkl")
+            or f.endswith("_quads.pkl")
+            or f.endswith("_yolo.pkl")
+        ):
+            return False
+        if data_suffix and not f[: -len(".pkl")].endswith(data_suffix):
+            return False
+        return True
 
     def _pickles_in(d: str) -> list[str]:
         return sorted(
@@ -466,16 +472,6 @@ def _add_detect_parser(subparsers: argparse._SubParsersAction) -> None:
         help=f"YOLO NMS IoU threshold (default: {DEFAULT_IOU_THRESHOLD}). "
         "Lower = more aggressive duplicate suppression.",
     )
-    p.add_argument(
-        "--nms-mode",
-        choices=("suppress", "fuse"),
-        default="suppress",
-        help="How to handle overlapping YOLO boxes. 'suppress' (default) "
-        "uses standard NMS (drop lower-conf overlapping boxes). 'fuse' "
-        "replaces each overlap cluster with the union of its boxes — "
-        "useful when the highest-conf box framing isn't always the one "
-        "that decodes the AprilTag. Fast pipeline only.",
-    )
     from yoto.constants import DEFAULT_BATCH_SIZE
 
     p.add_argument(
@@ -523,7 +519,6 @@ def _run_single_video(
     preset: str | None = None,
     conf: float | None = None,
     iou: float | None = None,
-    nms_mode: str = "suppress",
     pad_ratio: float | None = None,
     max_tag_offset_ratio: float | None = None,
     save_yolo: bool = True,
@@ -575,7 +570,6 @@ def _run_single_video(
                 preset=preset,
                 conf_threshold=conf,
                 iou_threshold=iou,
-                nms_mode=nms_mode,
                 pad_ratio=pad_ratio,
                 max_offset_ratio=max_tag_offset_ratio,
                 save_yolo=save_yolo,
@@ -586,12 +580,6 @@ def _run_single_video(
                 silence_ids=silence_ids,
             )
         else:
-            if nms_mode != "suppress":
-                print(
-                    "WARNING: --nms-mode fuse is only implemented for the "
-                    "fast pipeline. The simple pipeline will use standard "
-                    "NMS via ultralytics."
-                )
             from yoto.detection import run_detection_simple
 
             run_detection_simple(
@@ -634,8 +622,6 @@ def _build_worker_cmd(
         cmd.extend(["--conf", str(args.conf)])
     if getattr(args, "iou", None) is not None:
         cmd.extend(["--iou", str(args.iou)])
-    if getattr(args, "nms_mode", None):
-        cmd.extend(["--nms-mode", args.nms_mode])
     if getattr(args, "pad_ratio", None) is not None:
         cmd.extend(["--pad-ratio", str(args.pad_ratio)])
     if getattr(args, "max_tag_offset_ratio", None) is not None:
@@ -1046,7 +1032,6 @@ def _run_detect(args: argparse.Namespace) -> None:
             worker_tmpl.extend(["--apriltag-preset", args.apriltag_preset])
         worker_tmpl.extend(["--conf", str(args.conf)])
         worker_tmpl.extend(["--iou", str(args.iou)])
-        worker_tmpl.extend(["--nms-mode", args.nms_mode])
         worker_tmpl.extend(["--pad-ratio", str(args.pad_ratio)])
         worker_tmpl.extend(["--max-tag-offset-ratio", str(args.max_tag_offset_ratio)])
         worker_tmpl.extend(["--tag-family", args.tag_family])
@@ -1086,7 +1071,6 @@ def _run_detect(args: argparse.Namespace) -> None:
                 preset=args.apriltag_preset,
                 conf=args.conf,
                 iou=args.iou,
-                nms_mode=args.nms_mode,
                 pad_ratio=args.pad_ratio,
                 max_tag_offset_ratio=args.max_tag_offset_ratio,
                 save_yolo=args.save_yolo,
@@ -1359,6 +1343,7 @@ def _clean_one_pickle(
     import traceback
 
     from yoto.cleaning import clean_tracking_data
+    from yoto.exceptions import EmptyTrackingError
     from yoto.constants import (
         DEFAULT_FINAL_JUMP_PASS,
         DEFAULT_MAX_CONSECUTIVE_MISSES,
@@ -1487,6 +1472,13 @@ def _clean_one_pickle(
             f"recovered={metrics['long_gap_recovered_count']} | "
             f"final_jump_del={metrics['final_jump_deleted_count']} | "
             f"snap_threshold={metrics['snap_threshold_px']:.1f}px"
+        )
+        return (pkl_path, None)
+    except EmptyTrackingError as exc:
+        # No usable tracks (empty input, or every tag below min_detections).
+        # Skip cleanly, same shape as the early empty-pickle short-circuit.
+        logging.getLogger(__name__).warning(
+            "%s — skipping %s (no clean pickle written).", exc, pkl_path
         )
         return (pkl_path, None)
     except Exception:

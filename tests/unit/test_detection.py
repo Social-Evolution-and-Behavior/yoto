@@ -13,7 +13,6 @@ from yoto.detection import (
     _build_apriltag_params_fast,
     _build_apriltag_params_simple,
     _crop_and_pack,
-    _fuse_overlapping_boxes,
     _process_frame_cpu,
     _reproject_tags,
 )
@@ -300,92 +299,3 @@ class TestProcessFrameCpu:
         assert yolo_rows[0]["tag_id"] == -1
         assert yolo_rows[0]["confidence"] == pytest.approx(0.91, rel=1e-3)
         mock_detector.detect.assert_called_once()
-
-
-class TestFuseOverlappingBoxes:
-    """Tests for the custom fusion-NMS replacement."""
-
-    @staticmethod
-    def _dets(rows: list[list[float]]) -> Any:
-        """Build a torch tensor of shape (N, 6) from a list of rows."""
-        import torch
-
-        return torch.tensor(rows, dtype=torch.float32)
-
-    def test_empty_input_returns_empty(self) -> None:
-        import torch
-
-        dets = torch.empty((0, 6), dtype=torch.float32)
-        out = _fuse_overlapping_boxes(dets, iou_thres=0.4)
-        assert out.numel() == 0
-
-    def test_non_overlapping_boxes_unchanged(self) -> None:
-        # Two boxes far apart, IoU=0.
-        dets = self._dets(
-            [
-                [0.0, 0.0, 10.0, 10.0, 0.9, 0.0],
-                [100.0, 100.0, 110.0, 110.0, 0.5, 0.0],
-            ]
-        )
-        out = _fuse_overlapping_boxes(dets, iou_thres=0.4)
-        assert out.shape == (2, 6)
-        # Sorted by descending conf — higher-conf box comes first.
-        assert out[0, 4].item() == pytest.approx(0.9)
-        assert out[1, 4].item() == pytest.approx(0.5)
-
-    def test_overlapping_pair_fuses_to_union(self) -> None:
-        # Boxes overlap heavily: IoU = 64 / 136 ≈ 0.47.
-        dets = self._dets(
-            [
-                [0.0, 0.0, 10.0, 10.0, 0.9, 0.0],
-                [2.0, 2.0, 12.0, 12.0, 0.3, 0.0],
-            ]
-        )
-        out = _fuse_overlapping_boxes(dets, iou_thres=0.4)
-        assert out.shape == (1, 6)
-        # Union: min/max of corners.
-        assert out[0, 0].item() == pytest.approx(0.0)
-        assert out[0, 1].item() == pytest.approx(0.0)
-        assert out[0, 2].item() == pytest.approx(12.0)
-        assert out[0, 3].item() == pytest.approx(12.0)
-        # Max confidence wins.
-        assert out[0, 4].item() == pytest.approx(0.9)
-
-    def test_high_iou_threshold_keeps_separate(self) -> None:
-        # Same pair as above (IoU ≈ 0.47) but threshold 0.5 — no fusion.
-        dets = self._dets(
-            [
-                [0.0, 0.0, 10.0, 10.0, 0.9, 0.0],
-                [2.0, 2.0, 12.0, 12.0, 0.3, 0.0],
-            ]
-        )
-        out = _fuse_overlapping_boxes(dets, iou_thres=0.5)
-        assert out.shape == (2, 6)
-
-    def test_chain_clusters_via_connected_components(self) -> None:
-        # A-B overlap (IoU ≈ 0.667), B-C overlap (IoU ≈ 0.667),
-        # A-C IoU ≈ 0.429 < 0.5.  Connected components fuses all three.
-        dets = self._dets(
-            [
-                [0.0, 0.0, 10.0, 10.0, 0.5, 0.0],
-                [2.0, 0.0, 12.0, 10.0, 0.9, 0.0],
-                [4.0, 0.0, 14.0, 10.0, 0.7, 0.0],
-            ]
-        )
-        out = _fuse_overlapping_boxes(dets, iou_thres=0.5)
-        assert out.shape == (1, 6)
-        assert out[0, 0].item() == pytest.approx(0.0)
-        assert out[0, 2].item() == pytest.approx(14.0)
-        # Max conf wins.
-        assert out[0, 4].item() == pytest.approx(0.9)
-
-    def test_fused_box_takes_class_of_highest_conf_member(self) -> None:
-        dets = self._dets(
-            [
-                [0.0, 0.0, 10.0, 10.0, 0.3, 1.0],
-                [2.0, 2.0, 12.0, 12.0, 0.9, 7.0],
-            ]
-        )
-        out = _fuse_overlapping_boxes(dets, iou_thres=0.4)
-        assert out.shape == (1, 6)
-        assert out[0, 5].item() == pytest.approx(7.0)

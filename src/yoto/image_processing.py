@@ -149,6 +149,63 @@ def invert(image: GrayImage) -> GrayImage:
     return out
 
 
+def wiener_deconvolve(
+    image: GrayImage,
+    psf_radius: float = 2.0,
+    noise_level: float = 0.01,
+) -> GrayImage:
+    """Wiener deconvolution via FFT with a disk-shaped point spread function.
+
+    Matches the reference implementation in
+    ``apriltag_project/optimization_script/optimize_apriltag.py`` so
+    presets tuned by the Optuna sweep produce identical results when
+    replayed through yoto.
+
+    Frequency-domain Wiener filter ``H* / (|H|^2 + NSR)`` applied to the
+    image with ``H`` = FFT of the disk PSF and NSR = ``noise_level``.
+    Cost is dominated by two real FFTs (O(N log N) on image area), not
+    by PSF size.
+
+    Parameters
+    ----------
+    image : GrayImage
+        ``uint8`` single-channel image.
+    psf_radius : float
+        Defocus disk radius in pixels. 1-2 = mild blur, 3-5 = moderate,
+        6+ = heavy.
+    noise_level : float
+        Tikhonov regularisation (noise-to-signal ratio).  Higher = less
+        deblurring, smoother output.  Typical range 0.001 - 0.05.
+
+    Returns
+    -------
+    GrayImage
+        Deconvolved ``uint8`` image, same size as input.
+    """
+    h, w = image.shape
+    f = image.astype(np.float32) / 255.0
+
+    cy, cx = h // 2, w // 2
+    ys = np.arange(h, dtype=np.float32) - cy
+    xs = np.arange(w, dtype=np.float32) - cx
+    xx, yy = np.meshgrid(xs, ys)
+    disk = (xx**2 + yy**2 <= psf_radius**2).astype(np.float32)
+    disk /= disk.sum()
+
+    # ifftshift so the PSF DC component lands at the corner (numpy FFT
+    # convention); equivalent to np.fft.ifftshift for an even-sized centred
+    # array.
+    psf = np.roll(disk, (-cy, -cx), axis=(0, 1))
+
+    psf_f = np.fft.rfft2(psf)
+    img_f = np.fft.rfft2(f)
+    denom = np.abs(psf_f) ** 2 + noise_level
+    result = np.fft.irfft2(img_f * psf_f.conj() / denom, s=(h, w))
+
+    out: GrayImage = np.clip(result * 255.0, 0, 255).astype(np.uint8)
+    return out
+
+
 def contrast_enhance_cv2(
     image: GrayImage,
     alpha: float = 2.0,

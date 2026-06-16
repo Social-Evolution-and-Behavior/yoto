@@ -77,6 +77,7 @@ from yoto.image_processing import (
     contrast_enhance_cv2,
     contrast_enhance_pil,
     unsharp_mask,
+    wiener_deconvolve,
 )
 
 logger = logging.getLogger(__name__)
@@ -317,8 +318,10 @@ def _enhance_and_detect(
         )
 
     if apriltag_params.get("use_wiener", False):
-        raise NotImplementedError(
-            "use_wiener is not yet implemented in yoto.image_processing"
+        img = wiener_deconvolve(
+            img,
+            psf_radius=float(apriltag_params.get("wiener_psf_radius", 2.0)),
+            noise_level=float(apriltag_params.get("wiener_noise_level", 0.01)),
         )
 
     if apriltag_params.get("use_unsharp", True):
@@ -1019,107 +1022,94 @@ class _ONNXModule:
         return torch.from_numpy(out_np).to(x.device)
 
 
-def _fuse_overlapping_boxes(dets: Any, iou_thres: float) -> Any:
-    """Greedy-cluster boxes by IoU and replace each cluster with the union.
-
-    Drop-in replacement for the suppression half of NMS.  Standard NMS
-    keeps the most-confident box of each overlap cluster and discards the
-    rest; this function instead returns one fused box per cluster, with
-    corners equal to the min/max of all member corners.  Confidence and
-    class are taken from the highest-confidence member.
-
-    "Cluster" is connected-components on the IoU adjacency graph (edge
-    iff ``IoU >= iou_thres``), so chains like A–B–C with B overlapping
-    both A and C all collapse into one box even when A and C don't
-    directly overlap.
-
-    Parameters
-    ----------
-    dets : Tensor
-        Shape ``(N, 6)`` with columns ``[x1, y1, x2, y2, conf, cls]``,
-        already conf-filtered and in xyxy format.
-    iou_thres : float
-        Boxes with pairwise ``IoU >= iou_thres`` are placed in the same
-        cluster.
-
-    Returns
-    -------
-    Tensor
-        Shape ``(M, 6)`` with ``M <= N``, same column layout, sorted by
-        descending confidence.
-    """
-    import torch
-    from torchvision.ops import box_iou  # type: ignore[import-untyped]
-
-    if dets.numel() == 0:
-        return dets
-
-    n = int(dets.shape[0])
-    adj = box_iou(dets[:, :4], dets[:, :4]) >= iou_thres
-
-    # Connected components via iterative BFS.  ``component[i] == -1`` means
-    # box ``i`` hasn't been assigned to a cluster yet.
-    component = [-1] * n
-    out_rows: list[Any] = []
-
-    for seed in range(n):
-        if component[seed] != -1:
-            continue
-        frontier = [seed]
-        members: list[int] = []
-        while frontier:
-            u = frontier.pop()
-            if component[u] != -1:
-                continue
-            component[u] = seed
-            members.append(u)
-            neighbours = adj[u].nonzero(as_tuple=True)[0].tolist()
-            for v in neighbours:
-                if component[v] == -1:
-                    frontier.append(v)
-
-        cluster = dets[members]
-        x1 = cluster[:, 0].min()
-        y1 = cluster[:, 1].min()
-        x2 = cluster[:, 2].max()
-        y2 = cluster[:, 3].max()
-        max_idx = int(cluster[:, 4].argmax())
-        out_rows.append(
-            torch.stack([x1, y1, x2, y2, cluster[max_idx, 4], cluster[max_idx, 5]])
-        )
-
-    fused = torch.stack(out_rows)
-    # Sort by descending confidence to match ultralytics NMS output order.
-    order = fused[:, 4].argsort(descending=True)
-    return fused[order]
-
-
-def _fuse_nms(
+def _custom_nms(
     preds: Any,
     conf_thres: float,
     iou_thres: float,
     max_det: int,
     nc: int,
 ) -> list[Any]:
-    """NMS-shaped wrapper that fuses overlapping boxes instead of suppressing.
+    """In-house NMS for the fast pipeline.
 
-    Signature mirrors :func:`ultralytics.utils.nms.non_max_suppression`
-    so it is a drop-in replacement at the call site.  Internally it
-    calls ultralytics NMS once with ``iou_thres=1.0`` (effectively no
-    suppression of distinct boxes) purely to reuse its conf filtering,
-    xywh→xyxy conversion, class-aware grouping and ``max_det`` capping,
-    then runs :func:`_fuse_overlapping_boxes` on each per-image result.
+    Mirrors the call signature and output contract of
+    ``ultralytics.utils.nms.non_max_suppression`` so it slots in
+    unchanged at the call site, but uses a single
+    :func:`torchvision.ops.batched_nms` per image instead of
+    Ultralytics' Python + many-small-kernel implementation.
+
+    Owning the NMS path also frees us from waiting on Ultralytics for
+    output-shape changes between YOLO releases.
+
+    Parameters
+    ----------
+    preds : Tensor
+        Raw YOLO-detect output, shape ``(B, 4 + nc, A)`` or
+        ``(B, A, 4 + nc)``.  First 4 channels are ``xywh`` in model-input
+        pixel space; remaining ``nc`` are per-class scores (already
+        sigmoid'd by the head).
+    conf_thres, iou_thres : float
+        Confidence and IoU thresholds.
+    max_det : int
+        Cap on detections kept per image (post-NMS).
+    nc : int
+        Number of classes.
+
+    Returns
+    -------
+    list[Tensor]
+        Per-image ``(M, 6)`` tensors with columns
+        ``[x1, y1, x2, y2, conf, cls]``, sorted by descending
+        confidence.  Empty ``(0, 6)`` tensor when nothing survives.
     """
-    from ultralytics.utils.nms import non_max_suppression
+    import torch
+    from torchvision.ops import batched_nms  # type: ignore[import-untyped]
 
-    pre = non_max_suppression(
-        preds,
-        conf_thres=conf_thres,
-        iou_thres=1.0,
-        max_det=max_det,
-        nc=nc,
-    )
-    return [_fuse_overlapping_boxes(d, iou_thres) for d in pre]
+    # Normalise to (B, A, 4 + nc): per-anchor leading the channel axis.
+    if preds.shape[1] == 4 + nc and preds.shape[2] != 4 + nc:
+        preds = preds.transpose(1, 2)
+
+    bsz = preds.shape[0]
+    out: list[Any] = []
+    for b in range(bsz):
+        x = preds[b]  # (A, 4 + nc)
+        xywh = x[:, :4]
+        scores = x[:, 4 : 4 + nc]
+        conf, cls = scores.max(dim=1)
+
+        keep = conf >= conf_thres
+        if not keep.any():
+            out.append(x.new_zeros((0, 6)))
+            continue
+
+        xywh = xywh[keep]
+        conf = conf[keep]
+        cls = cls[keep]
+
+        half_w = xywh[:, 2] * 0.5
+        half_h = xywh[:, 3] * 0.5
+        xyxy = torch.stack(
+            [
+                xywh[:, 0] - half_w,
+                xywh[:, 1] - half_h,
+                xywh[:, 0] + half_w,
+                xywh[:, 1] + half_h,
+            ],
+            dim=1,
+        )
+
+        # batched_nms returns indices sorted by descending score.
+        keep_idx = batched_nms(xyxy.float(), conf, cls, iou_thres)[:max_det]
+        out.append(
+            torch.cat(
+                [
+                    xyxy[keep_idx],
+                    conf[keep_idx].unsqueeze(1),
+                    cls[keep_idx].float().unsqueeze(1),
+                ],
+                dim=1,
+            )
+        )
+    return out
 
 
 def _pynvdec_predict(
@@ -1132,7 +1122,6 @@ def _pynvdec_predict(
     target_size: int = DEFAULT_TARGET_SIZE,
     max_det: int = DEFAULT_MAX_DETECTIONS,
     nc: int = 1,
-    nms_mode: str = "suppress",
     debug: bool = False,
 ) -> Iterator[_NvdecResult]:
     """Drop-in generator replacement for ``model.predict(stream=True)``.
@@ -1158,11 +1147,6 @@ def _pynvdec_predict(
         Maximum detections per frame.
     nc : int
         Number of object classes.
-    nms_mode : str
-        ``"suppress"`` (default) — standard NMS that drops lower-conf
-        boxes whose IoU with a kept box exceeds the threshold.
-        ``"fuse"`` — :func:`_fuse_nms` replaces each overlap cluster
-        with the min/max-corner union (see its docstring for details).
     debug : bool
         When True, populate ``speed`` dicts with real timings.
 
@@ -1173,11 +1157,6 @@ def _pynvdec_predict(
     """
     import torch
     import PyNvVideoCodec as nvc  # type: ignore[import-untyped]
-    from ultralytics.utils.nms import non_max_suppression
-
-    if nms_mode not in ("suppress", "fuse"):
-        raise ValueError(f"nms_mode must be 'suppress' or 'fuse', got {nms_mode!r}")
-    nms_fn = _fuse_nms if nms_mode == "fuse" else non_max_suppression
 
     dec = nvc.ThreadedDecoder(
         video_path,
@@ -1225,7 +1204,7 @@ def _pynvdec_predict(
 
         if isinstance(preds, (tuple, list)):
             preds = preds[0]
-        nms_out = nms_fn(
+        nms_out = _custom_nms(
             preds,
             conf_thres=conf_thres,
             iou_thres=iou_thres,
@@ -1597,7 +1576,6 @@ def run_detection_fast(
     debug: bool = False,
     apriltag_params: dict[str, Any] | None = None,
     preset: str | None = None,
-    nms_mode: str = "suppress",
     save_yolo: bool = True,
     save_quads: bool = False,
     tag_family: str = DEFAULT_TAG_FAMILY,
@@ -1640,10 +1618,6 @@ def run_detection_fast(
         When True, collect and print per-stage profiling information.
     apriltag_params : dict[str, Any] | None
         Override default AprilTag / image-processing parameters.
-    nms_mode : str
-        ``"suppress"`` (default) keeps standard NMS; ``"fuse"`` replaces
-        each overlap cluster with the union of its boxes (see
-        :func:`_fuse_overlapping_boxes`).
 
     Returns
     -------
@@ -1711,7 +1685,6 @@ def run_detection_fast(
         target_size=target_size,
         max_det=DEFAULT_MAX_DETECTIONS,
         nc=yolo_nc,
-        nms_mode=nms_mode,
         debug=debug,
     )
     results_tag: list[dict[tuple[Any, str], Any]] = []
@@ -1858,7 +1831,6 @@ def run_detection_fast(
         extra={
             "yoto_yolo_weights": yolo_weights,
             "yoto_preset": preset,
-            "yoto_nms_mode": nms_mode,
             "yoto_tag_family": tag_family,
             "yoto_max_tag_id": max_tag_id,
             "yoto_silence_ids": list(silence_ids) if silence_ids else [],

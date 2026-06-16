@@ -189,7 +189,6 @@ single file.
 | `yoto_yolo_weights` | str | Path to the YOLO weights used for detection |
 | `yoto_preset` | str \| None | AprilTag preset (built-in name or JSON path), or `None` for defaults |
 | `yoto_pad_ratio` | float | Per-axis padding ratio applied around each YOLO box before AprilTag decoding |
-| `yoto_nms_mode` | str | `"suppress"` (standard NMS) or `"fuse"` (replace overlap clusters with union). Fast pipeline only |
 
 ### YOLO-fill knobs and counts
 

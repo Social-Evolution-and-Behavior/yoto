@@ -13,6 +13,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from yoto.exceptions import EmptyTrackingError
 from yoto.constants import (
     ASS_TYPE_INTERPOLATED,
     ASS_TYPE_NONE,
@@ -1189,6 +1190,9 @@ def clean_tracking_data(
     """
     input_attrs = dict(frame_data.attrs)
 
+    if frame_data.empty or frame_data.shape[1] == 0:
+        raise EmptyTrackingError("Input tracking DataFrame is empty (no detections).")
+
     # Measure imaging scale from decoded tag corners *before* any tags
     # are filtered out — broader sample, more robust median.
     median_tag_side_px, mm_per_px, scale_sample_count = compute_pixel_scale(
@@ -1196,6 +1200,7 @@ def clean_tracking_data(
     )
 
     id_list = np.unique(frame_data.columns.get_level_values(0))
+    n_input_ids = len(id_list)
 
     # --- Step 1: remove low-count IDs ---
     for tag_id in id_list:
@@ -1206,6 +1211,12 @@ def clean_tracking_data(
 
     frame_data.columns = frame_data.columns.remove_unused_levels()
     id_list = np.unique(frame_data.columns.get_level_values(0))
+
+    if len(id_list) == 0:
+        raise EmptyTrackingError(
+            f"No tag reached the min_detections={min_detections} threshold "
+            f"({n_input_ids} raw ID(s) in input)."
+        )
 
     # Baseline metrics (before any cleaning).
     total_samples = int(len(frame_data.index) * len(id_list))

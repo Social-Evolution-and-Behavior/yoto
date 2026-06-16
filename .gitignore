@@ -32,6 +32,8 @@ coverage.xml
 
 # Documentation
 docs/site/
+notebooks/
+site/
 
 # OS
 .DS_Store
