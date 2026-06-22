@@ -1443,6 +1443,7 @@ def clean_tracking_data(
     ass_types_after = frame_data.xs(COL_ASS_TYPE, axis=1, level=1)[id_list]
     filled_count = int((ass_types_after == ASS_TYPE_INTERPOLATED).values.sum())
     yolo_inferred_count = int((ass_types_after == ASS_TYPE_YOLO_INFERRED).values.sum())
+    final_count = int((ass_types_after != ASS_TYPE_NONE).values.sum())
 
     total_gaps = original_missing_count + jump_deleted_count
     total_detections = original_good_count + jump_deleted_count
@@ -1450,6 +1451,7 @@ def clean_tracking_data(
     metrics: CleaningMetrics = {
         "total_samples": total_samples,
         "total_detections": total_detections,
+        "final_count": final_count,
         "original_good_count": original_good_count,
         "original_bad_count": jump_deleted_count,
         "original_missing_count": original_missing_count,

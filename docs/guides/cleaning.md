@@ -116,7 +116,8 @@ The `metrics` dict returned alongside the cleaned DataFrame contains:
 | Key | Description |
 |-----|-------------|
 | `total_samples` | `n_frames × n_IDs` |
-| `total_detections` | All raw detections (good + jumps) |
+| `total_detections` | All raw detections (good + jumps) — the "raw" count |
+| `final_count` | Cells with any non-`NONE` assignment after all steps — read directly from the final array |
 | `original_good_count` | Raw detections that survived the jump filter |
 | `original_bad_count` | Raw detections deleted as jumps |
 | `original_missing_count` | Frame/tag cells that were already NaN in the input |

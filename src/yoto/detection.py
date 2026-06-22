@@ -82,6 +82,10 @@ from yoto.image_processing import (
 
 logger = logging.getLogger(__name__)
 
+IMAGE_EXTENSIONS: frozenset[str] = frozenset(
+    {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp"}
+)
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
@@ -185,10 +189,18 @@ def _compute_crop_layout(
     bounds: list[tuple[int, int, int, int]] = []
     offsets_xy: list[tuple[int, int]] = []
 
+    if len(boxes_np) > 0:
+        widths = boxes_np[:, 2] - boxes_np[:, 0]
+        heights = boxes_np[:, 3] - boxes_np[:, 1]
+        cap_x = int(round(pad_ratio * float(np.median(widths))))
+        cap_y = int(round(pad_ratio * float(np.median(heights))))
+    else:
+        cap_x = cap_y = 0
+
     for box in boxes_np:
         x1, y1, x2, y2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
-        pad_x = int(round(pad_ratio * (x2 - x1)))
-        pad_y = int(round(pad_ratio * (y2 - y1)))
+        pad_x = min(int(round(pad_ratio * (x2 - x1))), cap_x)
+        pad_y = min(int(round(pad_ratio * (y2 - y1))), cap_y)
         x1 = max(0, x1 - pad_x)
         y1 = max(0, y1 - pad_y)
         x2 = min(frame_w, x2 + pad_x)
@@ -671,6 +683,74 @@ def _process_frame_cpu(
         )
 
     return frame_dict, quad_rows, all_yolo_rows
+
+
+def _process_frame_full(
+    frame_idx: int,
+    frame: ImageType,
+    apriltag_params: dict[str, Any],
+    detector: Any,
+) -> dict[tuple[Any, str], Any]:
+    """Run AprilTag detection on the full frame without YOLO cropping.
+
+    Used by the ``no_yolo`` path in both video and image detection.
+    """
+    frame_dict: dict[tuple[Any, str], Any] = {(COL_FRAME, ""): frame_idx}
+
+    gray: GrayImage = (
+        cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
+    )
+    tags, _ = _enhance_and_detect(gray, apriltag_params, detector, save_quads=False)
+
+    for tag in tags:
+        tag_id: int = tag["id"]
+        if tag_id > MAX_VALID_TAG_ID:
+            continue
+        cx, cy = tag["center"]
+        frame_dict[(tag_id, COL_CENTER_X)] = cx
+        frame_dict[(tag_id, COL_CENTER_Y)] = cy
+        frame_dict[(tag_id, COL_CORNERS)] = tag["lb-rb-rt-lt"].copy()
+
+    return frame_dict
+
+
+def _draw_image_overlay(
+    image: ImageType,
+    boxes_np: BBoxArray,
+    frame_dict: dict[tuple[Any, str], Any],
+) -> np.ndarray[Any, np.dtype[np.uint8]]:
+    """Draw YOLO boxes and AprilTag detections onto *image*, return BGR result."""
+    out: np.ndarray[Any, np.dtype[np.uint8]] = (
+        image.copy() if image.ndim == 3 else cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+    )
+
+    for box in boxes_np:
+        x1, y1, x2, y2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
+        cv2.rectangle(out, (x1, y1), (x2, y2), (255, 100, 0), 2)
+
+    tag_ids = {k[0] for k in frame_dict if k[0] != COL_FRAME}
+    for tag_id in tag_ids:
+        cx = frame_dict.get((tag_id, COL_CENTER_X))
+        cy = frame_dict.get((tag_id, COL_CENTER_Y))
+        corners = frame_dict.get((tag_id, COL_CORNERS))
+        if corners is not None:
+            pts = corners.astype(int).reshape(-1, 1, 2)
+            cv2.polylines(out, [pts], isClosed=True, color=(0, 200, 255), thickness=2)
+        if cx is not None and cy is not None:
+            ix, iy = int(cx), int(cy)
+            cv2.circle(out, (ix, iy), 6, (0, 255, 0), -1)
+            cv2.putText(
+                out,
+                str(tag_id),
+                (ix + 8, iy),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 255, 0),
+                2,
+                cv2.LINE_AA,
+            )
+
+    return out
 
 
 def _process_frame_precomposited(
@@ -1316,7 +1396,7 @@ def _stamp_attrs(
 
 
 DEFAULT_WEIGHTS = os.path.normpath(
-    os.path.join(os.path.dirname(__file__), "..", "..", "models", "detect14.pt")
+    os.path.join(os.path.dirname(__file__), "..", "..", "models", "detect34.pt")
 )
 
 
@@ -1375,6 +1455,7 @@ def run_detection_simple(
     tag_family: str = DEFAULT_TAG_FAMILY,
     max_tag_id: int | None = None,
     silence_ids: list[int] | None = None,
+    no_yolo: bool = False,
 ) -> pd.DataFrame:
     """Run the simple (portable) YOLO + AprilTag detection pipeline.
 
@@ -1437,27 +1518,10 @@ def run_detection_simple(
 
     start_time = time.time()
 
-    # Load models
-    try:
-        seg_model = YOLO(yolo_weights, task="detect")
-    except Exception as exc:
-        raise ModelLoadError(yolo_weights, str(exc)) from exc
-
     detector = _create_detector(apriltag_params, family=tag_family)
     if max_tag_id is None:
         max_tag_id = default_max_tag_id_for_family(tag_family)
-    silence_arr = np.asarray(silence_ids, dtype=np.int64) if silence_ids else None
 
-    results = seg_model.predict(
-        source=video_path,
-        conf=conf_threshold,
-        iou=iou_threshold,
-        stream=True,
-        batch=2,
-        verbose=False,
-        half=True,
-        task="detect",
-    )
     results_tag: list[dict[tuple[Any, str], Any]] = []
     quads_all: list[dict[str, Any]] = []
     yolo_all: list[dict[str, Any]] = []
@@ -1466,99 +1530,306 @@ def run_detection_simple(
 
     disable_tqdm = bool(os.environ.get("YOTO_NO_PROGRESS"))
     status_update = make_status_updater(video_path, num_frames)
-    for i, result in enumerate(
-        tqdm(
-            results,
-            desc="Processing frames",
-            total=num_frames,
-            miniters=20,
-            disable=disable_tqdm,
-        )
-    ):
-        frame = result.orig_img
-        boxes_np = result.boxes.xyxy.cpu().numpy()
-        confs_np = result.boxes.conf.cpu().numpy() if save_yolo else None
-        frame_height, frame_width = frame.shape[0], frame.shape[1]
 
-        frame_dict, quad_rows, yolo_rows = _process_frame_cpu(
-            i,
-            frame,
-            boxes_np,
-            frame_width,
-            frame_height,
-            pad_ratio,
-            apriltag_params,
-            detector,
-            confs_np=confs_np,
-            max_offset_ratio=max_offset_ratio,
-            max_tag_id=max_tag_id,
-            silence_ids=silence_arr,
-            save_yolo=save_yolo,
-            save_quads=save_quads,
-        )
-        results_tag.append(frame_dict)
-        if save_quads:
-            quads_all.extend(quad_rows)
-        if save_yolo:
-            yolo_all.extend(yolo_rows)
-        status_update(i + 1)
+    if no_yolo:
+        cap = cv2.VideoCapture(video_path)
+        try:
+            for i in tqdm(
+                range(num_frames),
+                desc="Processing frames",
+                total=num_frames,
+                miniters=20,
+                disable=disable_tqdm,
+            ):
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                results_tag.append(
+                    _process_frame_full(i, frame, apriltag_params, detector)
+                )
+                status_update(i + 1)
+        finally:
+            cap.release()
+    else:
+        silence_arr = np.asarray(silence_ids, dtype=np.int64) if silence_ids else None
+        try:
+            seg_model = YOLO(yolo_weights, task="detect")
+        except Exception as exc:
+            raise ModelLoadError(yolo_weights, str(exc)) from exc
 
-    results.close()
+        yolo_results = seg_model.predict(
+            source=video_path,
+            conf=conf_threshold,
+            iou=iou_threshold,
+            stream=True,
+            batch=2,
+            verbose=False,
+            half=True,
+            task="detect",
+        )
+        for i, result in enumerate(
+            tqdm(
+                yolo_results,
+                desc="Processing frames",
+                total=num_frames,
+                miniters=20,
+                disable=disable_tqdm,
+            )
+        ):
+            frame = result.orig_img
+            boxes_np = result.boxes.xyxy.cpu().numpy()
+            confs_np = result.boxes.conf.cpu().numpy() if save_yolo else None
+            frame_height, frame_width = frame.shape[0], frame.shape[1]
+
+            frame_dict, quad_rows, yolo_rows = _process_frame_cpu(
+                i,
+                frame,
+                boxes_np,
+                frame_width,
+                frame_height,
+                pad_ratio,
+                apriltag_params,
+                detector,
+                confs_np=confs_np,
+                max_offset_ratio=max_offset_ratio,
+                max_tag_id=max_tag_id,
+                silence_ids=silence_arr,
+                save_yolo=save_yolo,
+                save_quads=save_quads,
+            )
+            results_tag.append(frame_dict)
+            if save_quads:
+                quads_all.extend(quad_rows)
+            if save_yolo:
+                yolo_all.extend(yolo_rows)
+            status_update(i + 1)
+        yolo_results.close()
 
     # Build DataFrame
     df = pd.DataFrame(results_tag)
     df.columns = pd.MultiIndex.from_tuples(df.columns)
     df = df.set_index(COL_FRAME)
-    _stamp_attrs(
-        df,
-        video_path,
-        pipeline="simple",
-        extra={
-            "yoto_yolo_weights": yolo_weights,
-            "yoto_preset": preset,
-            "yoto_pad_ratio": pad_ratio,
-            "yoto_tag_family": tag_family,
-            "yoto_max_tag_id": max_tag_id,
-            "yoto_silence_ids": list(silence_ids) if silence_ids else [],
-        },
-    )
+    pipeline_label = "simple_noyolo" if no_yolo else "simple"
+    extra: dict[str, Any] = {
+        "yoto_preset": preset,
+        "yoto_tag_family": tag_family,
+        "yoto_max_tag_id": max_tag_id,
+    }
+    if not no_yolo:
+        extra.update(
+            {
+                "yoto_yolo_weights": yolo_weights,
+                "yoto_pad_ratio": pad_ratio,
+                "yoto_silence_ids": list(silence_ids) if silence_ids else [],
+            }
+        )
+    _stamp_attrs(df, video_path, pipeline=pipeline_label, extra=extra)
     df.to_pickle(out_pkl)
-    if save_quads:
-        _save_sidecar(
-            quads_all,
-            out_pkl,
-            video_path,
-            "simple",
-            suffix="_quads",
-            kind="quads",
-            empty_columns=[COL_CENTER_X, COL_CENTER_Y, COL_CORNERS],
-        )
-    if save_yolo:
-        _save_sidecar(
-            yolo_all,
-            out_pkl,
-            video_path,
-            "simple",
-            suffix="_yolo",
-            kind="yolo_boxes",
-            empty_columns=[
-                COL_BOX_X1,
-                COL_BOX_Y1,
-                COL_BOX_X2,
-                COL_BOX_Y2,
-                COL_CENTER_X,
-                COL_CENTER_Y,
-                "confidence",
-                "decoded",
-                "tag_id",
-            ],
-        )
+    if not no_yolo:
+        if save_quads:
+            _save_sidecar(
+                quads_all,
+                out_pkl,
+                video_path,
+                "simple",
+                suffix="_quads",
+                kind="quads",
+                empty_columns=[COL_CENTER_X, COL_CENTER_Y, COL_CORNERS],
+            )
+        if save_yolo:
+            _save_sidecar(
+                yolo_all,
+                out_pkl,
+                video_path,
+                "simple",
+                suffix="_yolo",
+                kind="yolo_boxes",
+                empty_columns=[
+                    COL_BOX_X1,
+                    COL_BOX_Y1,
+                    COL_BOX_X2,
+                    COL_BOX_Y2,
+                    COL_CENTER_X,
+                    COL_CENTER_Y,
+                    "confidence",
+                    "decoded",
+                    "tag_id",
+                ],
+            )
 
     total_time = time.time() - start_time
     m, s = divmod(int(total_time), 60)
     logger.info("Total processing time for %s: %dm %02ds", video_path, m, s)
 
     return df
+
+
+def run_detection_images(
+    image_path: str,
+    output_root: str | None = None,
+    yolo_weights: str = DEFAULT_WEIGHTS,
+    data_suffix: str = "_apriltagDetect14",
+    conf_threshold: float = DEFAULT_CONF_THRESHOLD,
+    pad_ratio: float = DEFAULT_PAD_RATIO,
+    max_offset_ratio: float = DEFAULT_MAX_TAG_OFFSET_RATIO,
+    apriltag_params: dict[str, Any] | None = None,
+    preset: str | None = None,
+    tag_family: str = DEFAULT_TAG_FAMILY,
+    max_tag_id: int | None = None,
+    no_yolo: bool = False,
+) -> list[pd.DataFrame]:
+    """Run YOLO + AprilTag detection on a single image or a folder of images.
+
+    Each image is treated as a one-frame recording.  Outputs per image:
+
+    * ``<output_root>/tracking/data/<stem><data_suffix>.pkl``
+    * ``<output_root>/tracking/image_output/<stem><data_suffix>_overlay.png``
+
+    Parameters
+    ----------
+    image_path : str
+        Path to a single image file or a directory of images.
+    output_root : str | None
+        Base directory for outputs.  Defaults to the image's parent directory
+        (single file) or the image directory itself (folder input).
+    yolo_weights : str
+        Path to YOLO weights.  Ignored when *no_yolo* is True.
+    data_suffix : str
+        Suffix appended to the image stem for output filenames.
+    conf_threshold : float
+        YOLO confidence threshold.  Ignored when *no_yolo* is True.
+    pad_ratio : float
+        Per-axis padding ratio added around each YOLO box before cropping.
+    max_offset_ratio : float
+        Drop AprilTag decodes whose center is farther from the source YOLO
+        box center than ``ratio * min(box_w, box_h)``.
+    apriltag_params : dict[str, Any] | None
+        Override default AprilTag / image-processing parameters.
+    preset : str | None
+        AprilTag preset name or JSON path.
+    tag_family : str
+        AprilTag family string.
+    max_tag_id : int | None
+        Maximum tag ID to accept; defaults to family maximum.
+    no_yolo : bool
+        When True, skip YOLO entirely and run AprilTag on the full image.
+
+    Returns
+    -------
+    list[pd.DataFrame]
+        One DataFrame per image (each has a single row, frame index 0).
+    """
+    if apriltag_params is None:
+        apriltag_params = _build_apriltag_params_simple()
+    if preset is not None:
+        from yoto.apriltag_presets import load_preset, merge_preset
+
+        apriltag_params = merge_preset(apriltag_params, load_preset(preset))
+
+    if max_tag_id is None:
+        max_tag_id = default_max_tag_id_for_family(tag_family)
+
+    # Collect image paths
+    if os.path.isfile(image_path):
+        image_paths = [image_path]
+        root = output_root or os.path.dirname(os.path.abspath(image_path))
+    elif os.path.isdir(image_path):
+        image_paths = sorted(
+            os.path.join(image_path, f)
+            for f in os.listdir(image_path)
+            if not f.startswith(".")
+            and os.path.splitext(f)[1].lower() in IMAGE_EXTENSIONS
+        )
+        root = output_root or os.path.abspath(image_path)
+    else:
+        raise FileNotFoundError(f"Image path not found: {image_path}")
+
+    if not image_paths:
+        raise FileNotFoundError(f"No images found in: {image_path}")
+
+    data_dir = os.path.join(root, "tracking", "data")
+    overlay_dir = os.path.join(root, "tracking", "image_output")
+    os.makedirs(data_dir, exist_ok=True)
+    os.makedirs(overlay_dir, exist_ok=True)
+
+    detector = _create_detector(apriltag_params, family=tag_family)
+
+    seg_model = None
+    if not no_yolo:
+        try:
+            seg_model = YOLO(yolo_weights, task="detect")
+        except Exception as exc:
+            raise ModelLoadError(yolo_weights, str(exc)) from exc
+
+    pipeline_label = "image_noyolo" if no_yolo else "image"
+
+    dfs: list[pd.DataFrame] = []
+    for img_path in tqdm(image_paths, desc="Images", disable=len(image_paths) == 1):
+        img_bgr = cv2.imread(img_path)
+        if img_bgr is None:
+            logger.warning("Could not read image, skipping: %s", img_path)
+            continue
+
+        frame_height, frame_width = img_bgr.shape[:2]
+        stem = os.path.splitext(os.path.basename(img_path))[0]
+
+        if no_yolo:
+            boxes_np = np.zeros((0, 4), dtype=np.float32)
+            frame_dict = _process_frame_full(0, img_bgr, apriltag_params, detector)
+        else:
+            assert seg_model is not None
+            yolo_results = list(
+                seg_model.predict(
+                    source=img_bgr,
+                    conf=conf_threshold,
+                    verbose=False,
+                    half=True,
+                    task="detect",
+                )
+            )
+            boxes_np = yolo_results[0].boxes.xyxy.cpu().numpy()
+            frame_dict, _, _ = _process_frame_cpu(
+                0,
+                img_bgr,
+                boxes_np,
+                frame_width,
+                frame_height,
+                pad_ratio,
+                apriltag_params,
+                detector,
+                max_offset_ratio=max_offset_ratio,
+                max_tag_id=max_tag_id,
+                save_yolo=False,
+                save_quads=False,
+            )
+
+        # Write overlay
+        overlay = _draw_image_overlay(img_bgr, boxes_np, frame_dict)
+        overlay_path = os.path.join(overlay_dir, f"{stem}{data_suffix}_overlay.png")
+        cv2.imwrite(overlay_path, overlay)
+        logger.info("Overlay: %s", overlay_path)
+
+        # Build single-row DataFrame and pickle
+        df = pd.DataFrame([frame_dict])
+        df.columns = pd.MultiIndex.from_tuples(df.columns)
+        df = df.set_index(COL_FRAME)
+        img_extra: dict[str, Any] = {
+            "yoto_preset": preset,
+            "yoto_source_image": img_path,
+            "yoto_tag_family": tag_family,
+            "yoto_max_tag_id": max_tag_id,
+        }
+        if not no_yolo:
+            img_extra["yoto_yolo_weights"] = yolo_weights
+        _stamp_attrs(df, img_path, pipeline=pipeline_label, extra=img_extra)
+
+        pkl_path = os.path.join(data_dir, f"{stem}{data_suffix}.pkl")
+        df.to_pickle(pkl_path)
+        logger.info("Pickle: %s", pkl_path)
+
+        dfs.append(df)
+
+    return dfs
 
 
 def run_detection_fast(

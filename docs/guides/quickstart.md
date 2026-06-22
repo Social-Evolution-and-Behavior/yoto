@@ -19,6 +19,14 @@ yoto detect /path/to/experiment.mp4 --yoloweights /path/to/yolo.pt --apriltag-pr
 
 # Decode a different AprilTag family (default is tag36ARTag)
 yoto detect /path/to/experiment.mp4 --yoloweights /path/to/yolo.pt --tag-family tag25h9
+
+# Drop IDs outside the valid family range, or silence specific known-misdecode IDs
+yoto detect /path/to/experiment.mp4 --yoloweights /path/to/yolo.pt --max-tag-id 200
+yoto detect /path/to/experiment.mp4 --yoloweights /path/to/yolo.pt --silence-ids 12,45
+
+# Run on a single image or folder of images (same pipeline, outputs to tracking/)
+yoto detect /path/to/frame.jpg --yoloweights /path/to/yolo.pt
+yoto detect /path/to/frames/  --yoloweights /path/to/yolo.pt
 ```
 
 See [Detection → AprilTag Presets](detection.md#apriltag-presets) for the

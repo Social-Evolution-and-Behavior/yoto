@@ -135,14 +135,33 @@ The shipped `ir.json` preset was produced by an Optuna sweep on
 infrared-illuminated footage; new presets can be dropped into
 `src/yoto/presets/` to be discovered by name.
 
+## Image Detection
+
+`yoto detect` accepts a single image file or a directory of images (jpg, jpeg, png, tif, tiff, bmp) in addition to videos. The same YOLO + AprilTag pipeline runs; outputs go into `tracking/image_output/` (annotated overlays) and `tracking/data/` (pickles) next to the input.
+
+```bash
+# Single image
+yoto detect /path/to/frame.jpg --yoloweights /path/to/yolo.pt
+
+# Folder of images
+yoto detect /path/to/frames/ --yoloweights /path/to/yolo.pt
+
+# Skip YOLO — run AprilTag directly on the full image (useful for testing)
+yoto detect /path/to/frame.jpg --yoloweights /path/to/yolo.pt --no-yolo True
+```
+
 ## Key Flags
 
 | Flag | Default | Effect |
 |------|---------|--------|
-| `--pad-ratio` | `0.34` | Per-axis padding added around each YOLO box before cropping (scales with tag size) |
+| `--pad-ratio` | `0.34` | Per-axis padding added around each YOLO box before cropping (scales with tag size). Padding is capped at `pad_ratio × median(box_dim)` across the batch so one unusually large box can't produce an oversized crop. |
 | `--tag-offset-filter` | `True` | Drop AprilTag decodes whose center is too far from the source YOLO box center — catches misdecodes in padding regions |
 | `--max-tag-offset-ratio` | `0.6` | Distance threshold for `--tag-offset-filter`, as a fraction of `min(box_w, box_h)` |
 | `--tag-family` | `tag36ARTag` | AprilTag family passed to the decoder. Swap to decode a different family (e.g. `tag25h9`, `tag36h11`) without recompiling |
+| `--max-tag-id` | family-dependent | Drop any decode whose tag ID exceeds this value. Default is 237 for the ARTag family (to reject IDs outside the family's valid range), 999 for all other families. Override with `--max-tag-id N`. |
+| `--silence-ids` | none | Drop specific tag IDs unconditionally — for IDs known to be misdecode-prone in your setup. Space- or comma-separated: `--silence-ids 12 45` or `--silence-ids 12,45,67`. |
+| `--no-yolo` | `False` | Skip YOLO entirely and run AprilTag on the full image. Only useful for image input. |
+| `--batch-size` | `16` | Frames per GPU batch for the fast pipeline. Larger batches amortise NVDEC fetch and NMS overhead but cost more VRAM. Ignored when `--use-nvdec False`. |
 | `--save-yolo` | `True` | Write the `_yolo.pkl` sidecar (disable if not using YOLO-fill in clean) |
 | `--save-quads` | `False` | Write the `_quads.pkl` sidecar (only needed for `render --quads` debug overlay) |
 | `--use-nvdec` | `True` | Use NVDEC hardware decoding (fast pipeline); `False` falls back to the portable Ultralytics pipeline |
@@ -150,8 +169,8 @@ infrared-illuminated footage; new presets can be dropped into
 ## How It Works
 
 1. **YOLO detection** — a trained YOLOv8 model locates ant bounding boxes
-2. **Cropping** — detected regions are padded by `pad_ratio × box_dim` on each side (scales with apparent tag size) and cropped from the frame
-3. **Composite strip** — crops are packed side-by-side into one wide image
+2. **Crop layout** — padding bounds are computed for each box (`pad_ratio × box_dim`, capped at `pad_ratio × median(box_dim)` to prevent outliers from inflating crops)
+3. **GPU composite** — in the fast pipeline, crops are assembled into a single wide strip directly on GPU (zero CPU copy); the simple pipeline does this on CPU
 4. **Image enhancement** — unsharp masking and contrast boosting
 5. **AprilTag decoding** — the SEBLab detector runs once on the composite (parameters configurable via a preset; see above)
 6. **Reprojection + offset filter** — tag coordinates are mapped back to the original frame; decodes whose center is farther than `max_tag_offset_ratio × min(box_w, box_h)` from the source YOLO box center are dropped (catches misdecodes in padding regions). Disable with `--tag-offset-filter False`.

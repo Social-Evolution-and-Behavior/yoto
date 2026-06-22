@@ -13,10 +13,12 @@ In a reference benchmark, 7 days of 10 fps 4512×4512 footage of 100 clonal raid
 
 - **Two-stage detection** (YOLO → AprilTag): an order-of-magnitude faster than running AprilTag on full frames, with fewer false positives in busy scenes
 - **End-to-end pipeline**: `detect → clean → render` — raw decode, automatic gap-filling and jump-detection on trajectories, and overlay-video rendering
-- **GPU end-to-end**: NVDEC decode → TensorRT / ONNX YOLO inference → AprilTag → NVENC encode; threaded ffmpeg render ~2–3× faster than single-threaded `cv2.VideoWriter`
+- **GPU end-to-end**: NVDEC decode → TensorRT / ONNX YOLO inference → GPU composite → AprilTag → NVENC encode; threaded ffmpeg render ~2–3× faster than single-threaded `cv2.VideoWriter`
+- **Image detection**: `yoto detect` accepts a single image or a folder of images in addition to videos — same YOLO + AprilTag pipeline, outputs to `tracking/`
 - **AprilTag presets**: swap detection / image-processing parameters non-destructively via `--apriltag-preset` (built-in `ir` preset, plus support for any JSON file including Optuna `best_params*.json` dumps)
 - **Two detection backends**: portable simple mode (any CUDA box) and NVDEC-accelerated fast mode for production runs
 - **Configurable tag family**: `yoto detect --tag-family` swaps the AprilTag family (default `tag36ARTag`) without recompiling the C decoder
+- **Tag ID filtering**: `--max-tag-id` drops out-of-family IDs (default 237 for ARTag); `--silence-ids` blacklists specific misdecode-prone IDs
 - **YOLO-fill gap recovery**: undecoded YOLO boxes are stitched into each tag's trajectory via a forward+backward chain matcher with collision resolution — recovers tag positions on frames where AprilTag failed to decode
 - **Auto px→mm calibration**: `yoto clean --tag-size` measures the median AprilTag side length from decoded corners and stores a `mm_per_px` scale on the clean pickle
 - **Self-describing output**: every clean pickle carries a `df.attrs` block with the YOTO version, all knobs used, per-step counts, and the imaging scale — see [Pickle Attributes](guides/cleaning.md#pickle-attributes)

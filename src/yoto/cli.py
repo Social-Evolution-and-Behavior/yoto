@@ -19,12 +19,15 @@ import sys
 import pandas as pd
 
 VIDEO_EXTENSIONS = frozenset({".mp4", ".avi", ".mkv", ".mov"})
+IMAGE_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp"})
 
 TRACKING_DIR = "tracking"
 TRACKING_SUBDIRS = {
     "raw_data": "raw_data",
     "clean_data": "clean_data",
     "video_output": "video_output",
+    "image_output": "image_output",
+    "image_data": "data",
     "logs": "logs",
 }
 
@@ -502,6 +505,12 @@ def _add_detect_parser(subparsers: argparse._SubParsersAction) -> None:
         "(default: False). Only needed for `yoto render --quads`.",
     )
     p.add_argument(
+        "--no-yolo",
+        action="store_true",
+        help="Skip YOLO and run AprilTag on the full frame (simple/portable "
+        "pipeline only; --use-nvdec is ignored when this flag is set)",
+    )
+    p.add_argument(
         "--debug",
         action="store_true",
         help="Enable debug profiling output",
@@ -527,6 +536,7 @@ def _run_single_video(
     batch_size: int | None = None,
     max_tag_id: int | None = None,
     silence_ids: list[int] | None = None,
+    no_yolo: bool = False,
 ) -> tuple[str, str | None]:
     """Run detection on one video. Returns ``(vpath, None)`` on success,
     or ``(vpath, traceback_text)`` on failure."""
@@ -558,7 +568,27 @@ def _run_single_video(
         output_dir = _tracking_layout(_recording_dir_for_video(vpath))["raw_data"]
 
     try:
-        if use_nvdec:
+        if no_yolo:
+            from yoto.detection import run_detection_simple
+
+            run_detection_simple(
+                video_path=vpath,
+                output_path=output_dir,
+                yolo_weights=yolo_weights,
+                data_suffix=data_suffix,
+                preset=preset,
+                conf_threshold=conf,
+                iou_threshold=iou,
+                pad_ratio=pad_ratio,
+                max_offset_ratio=max_tag_offset_ratio,
+                save_yolo=False,
+                save_quads=False,
+                tag_family=tag_family,
+                max_tag_id=max_tag_id,
+                silence_ids=silence_ids,
+                no_yolo=True,
+            )
+        elif use_nvdec:
             from yoto.detection import run_detection_fast
 
             run_detection_fast(
@@ -962,16 +992,57 @@ def _run_parallel_gnu(
     return results, runtimes, wall_time
 
 
+def _is_image_input(path: str) -> bool:
+    """Return True if *path* is an image file or a directory of images (no videos)."""
+    if os.path.isfile(path):
+        return os.path.splitext(path)[1].lower() in IMAGE_EXTENSIONS
+    if os.path.isdir(path):
+        entries = [f for f in os.listdir(path) if not f.startswith(".")]
+        has_images = any(
+            os.path.splitext(f)[1].lower() in IMAGE_EXTENSIONS for f in entries
+        )
+        has_videos = any(
+            os.path.splitext(f)[1].lower() in VIDEO_EXTENSIONS for f in entries
+        )
+        return has_images and not has_videos
+    return False
+
+
 def _run_detect(args: argparse.Namespace) -> None:
     """Execute the detect sub-command."""
     _configure_logging(args.debug)
     args.dataname = _normalize_dataname(args.dataname)
-
-    # --tag-offset-filter False == --max-tag-offset-ratio inf.  Collapse
-    # to a single value here so the rest of the dispatch logic (both
-    # sequential and the GNU-parallel worker template) handles one knob.
     if not args.tag_offset_filter:
         args.max_tag_offset_ratio = float("inf")
+
+    # Route image files / image-only folders to the image pipeline.
+    if _is_image_input(args.video):
+        from yoto.detection import run_detection_images
+
+        output_root = args.output_dir or None
+        try:
+            dfs = run_detection_images(
+                image_path=args.video,
+                output_root=output_root,
+                yolo_weights=args.yoloweights,
+                data_suffix=args.dataname,
+                conf_threshold=args.conf,
+                pad_ratio=args.pad_ratio,
+                max_offset_ratio=args.max_tag_offset_ratio,
+                preset=args.apriltag_preset,
+                tag_family=args.tag_family,
+                max_tag_id=args.max_tag_id,
+                no_yolo=args.no_yolo,
+            )
+        except FileNotFoundError as exc:
+            print(f"Error: {exc}")
+            sys.exit(1)
+        n_tags = sum(len(df.columns.get_level_values(0).unique()) for df in dfs)
+        print(
+            f"Processed {len(dfs)} image(s), {n_tags} total tag detection(s). "
+            f"Overlays → tracking/image_output/  |  Pickles → tracking/data/"
+        )
+        return
 
     video_paths = _resolve_video_paths(args.video)
     if not video_paths:
@@ -1045,6 +1116,8 @@ def _run_detect(args: argparse.Namespace) -> None:
             )
         worker_tmpl.extend(["--save-yolo", str(args.save_yolo)])
         worker_tmpl.extend(["--save-quads", str(args.save_quads)])
+        if args.no_yolo:
+            worker_tmpl.append("--no-yolo")
         input_root = (
             args.video
             if os.path.isdir(args.video)
@@ -1079,6 +1152,7 @@ def _run_detect(args: argparse.Namespace) -> None:
                 batch_size=args.batch_size,
                 max_tag_id=args.max_tag_id,
                 silence_ids=_parse_id_list(args.silence_ids, "--silence-ids"),
+                no_yolo=args.no_yolo,
             )
             if result[1] is not None:
                 logging.getLogger(__name__).error(
@@ -1119,6 +1193,7 @@ def _run_detect(args: argparse.Namespace) -> None:
             sys.exit(1)
 
 
+# ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 # Sub-command: clean
 # ---------------------------------------------------------------------------
@@ -1457,21 +1532,25 @@ def _clean_one_pickle(
             _write_csv(cleaned, clean_csv)
             print(f"  CSV:   {raw_csv}")
             print(f"  CSV:   {clean_csv}")
+        _n = metrics["total_samples"]
+        _raw = metrics["total_detections"]
+        _final = metrics["final_count"]
+        _raw_pct = 100.0 * _raw / _n if _n else 0.0
+        _final_pct = 100.0 * _final / _n if _n else 0.0
         print(
-            f"  detections={metrics['total_detections']}"
-            f"/{metrics['total_samples']} "
-            f"({100.0 * metrics['total_detections'] / metrics['total_samples']:.2f}%)"
-            f" | errors={metrics['original_bad_count']} "
-            f"({metrics['error_pct']:.2f}%) | "
-            f"filled={metrics['filled_count']}/{metrics['total_gaps']} gaps "
-            f"({metrics['filled_pct_of_gaps']:.2f}% recovered) | "
-            f"yolo_inferred={metrics['yolo_inferred_count']} "
-            f"({metrics['yolo_inferred_pct_of_gaps']:.2f}% of gaps) | "
-            f"pruned={metrics['yolo_pruned_count']} | "
-            f"rechained={metrics['yolo_rechained_count']} | "
-            f"recovered={metrics['long_gap_recovered_count']} | "
-            f"final_jump_del={metrics['final_jump_deleted_count']} | "
-            f"snap_threshold={metrics['snap_threshold_px']:.1f}px"
+            f"  raw: {_raw}/{_n} ({_raw_pct:.1f}%)"
+            f"  →  final: {_final}/{_n} ({_final_pct:.1f}%)"
+        )
+        print(
+            f"    errors={metrics['original_bad_count']} ({metrics['error_pct']:.2f}%)"
+            f" | interp={metrics['filled_count']}"
+            f" | yolo={metrics['yolo_inferred_count']}/{metrics['total_gaps']} gaps"
+            f" ({metrics['yolo_inferred_pct_of_gaps']:.1f}%)"
+            f" | pruned={metrics['yolo_pruned_count']}"
+            f" | rechained={metrics['yolo_rechained_count']}"
+            f" | recovered={metrics['long_gap_recovered_count']}"
+            f" | jump_del={metrics['final_jump_deleted_count']}"
+            f" | snap={metrics['snap_threshold_px']:.1f}px"
         )
         return (pkl_path, None)
     except EmptyTrackingError as exc:
