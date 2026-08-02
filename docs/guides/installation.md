@@ -45,7 +45,7 @@ Ultralytics path.
   NVENC the renderer silently falls back to `libx264` (slower) and
   without `-hwaccel cuda` it falls back to CPU decode via OpenCV.
 - [AprilTag library](https://github.com/Social-Evolution-and-Behavior/apriltag)
-  (SEBLab fork)
+  (LSEB fork)
 
 ### Optional (fast detection pipeline)
 

@@ -12,8 +12,10 @@ barcodes on ants in video frames:
   pre-processing.  Significantly faster but requires an NVIDIA GPU with
   NVDEC support and the ``PyNvVideoCodec`` package.
 
-Both pipelines produce identical output: a pandas ``DataFrame`` with a
-``MultiIndex`` of ``(tag_id, metric)`` columns indexed by frame number.
+Both pipelines produce identical output: a pandas ``DataFrame`` in
+long format with columns ``tag_id``, ``center_x``, ``center_y``,
+``corners``, indexed by frame number (non-unique — multiple rows per
+frame when multiple tags are detected, including duplicate tag IDs).
 """
 
 from __future__ import annotations
@@ -69,6 +71,10 @@ from yoto.constants import (
     FAST_UNSHARP_AMOUNT,
     FAST_UNSHARP_KERNEL,
     FAST_UNSHARP_SIGMA,
+    DEFAULT_WEIGHTS,
+    IMAGE_EXTENSIONS,
+    TRACKING_DIR,
+    TRACKING_SUBDIRS,
     MAX_VALID_TAG_ID,
     default_max_tag_id_for_family,
 )
@@ -100,6 +106,7 @@ def _build_apriltag_params_simple() -> dict[str, Any]:
         "refine_edges": DEFAULT_REFINE_EDGES,
         "decode_sharpening": DEFAULT_DECODE_SHARPENING,
         "max_hamming": DEFAULT_MAX_HAMMING,
+        "use_unsharp": True,
         "kernel_size": DEFAULT_UNSHARP_KERNEL,
         "sigma": DEFAULT_UNSHARP_SIGMA,
         "amount": DEFAULT_UNSHARP_AMOUNT,
@@ -116,6 +123,7 @@ def _build_apriltag_params_fast() -> dict[str, Any]:
         "refine_edges": DEFAULT_REFINE_EDGES,
         "decode_sharpening": FAST_DECODE_SHARPENING,
         "max_hamming": DEFAULT_MAX_HAMMING,
+        "use_unsharp": True,
         "kernel_size": FAST_UNSHARP_KERNEL,
         "sigma": FAST_UNSHARP_SIGMA,
         "amount": FAST_UNSHARP_AMOUNT,
@@ -130,7 +138,7 @@ def _create_detector(
     apriltag_params: dict[str, Any],
     family: str = DEFAULT_TAG_FAMILY,
 ) -> Any:
-    """Instantiate the AprilTag detector from the SEBLab fork.
+    """Instantiate the AprilTag detector from the LSEB fork.
 
     Parameters
     ----------
@@ -287,79 +295,119 @@ def _enhance_and_detect(
         recover missing detections in the cleaning step.
     """
     img = composite_gray
+    upscale_factor = 1.0
 
-    # Optional pre-stages (no-ops unless the preset enables them)
-    if apriltag_params.get("invert", False):
-        from yoto.image_processing import invert as _invert
-
-        img = _invert(img)
-
-    upscale_factor = float(apriltag_params.get("upscale", 1.0))
-    if upscale_factor != 1.0:
-        from yoto.image_processing import upscale as _upscale
-
-        img = _upscale(
-            img,
-            factor=upscale_factor,
-            interp=apriltag_params.get("upscale_interp", "lanczos"),
-        )
-
-    tone = apriltag_params.get("tone_map", "none")
-    if tone and tone != "none":
-        from yoto.image_processing import tone_map as _tone_map
-
-        img = _tone_map(img, method=tone)
-
-    if apriltag_params.get("use_gamma", False):
-        from yoto.image_processing import gamma_correct
-
-        img = gamma_correct(img, gamma=float(apriltag_params.get("gamma", 1.0)))
-
-    if apriltag_params.get("use_median_blur", False):
-        k = int(apriltag_params.get("median_kernel", 3))
-        if k % 2 == 0:
-            k += 1
-        img = cv2.medianBlur(img, k)
-
-    if apriltag_params.get("use_bilateral", False):
-        img = cv2.bilateralFilter(
-            img,
-            d=int(apriltag_params.get("bilateral_d", 5)),
-            sigmaColor=float(apriltag_params.get("bilateral_sigma_color", 50.0)),
-            sigmaSpace=float(apriltag_params.get("bilateral_sigma_space", 50.0)),
-        )
-
-    if apriltag_params.get("use_wiener", False):
-        img = wiener_deconvolve(
-            img,
-            psf_radius=float(apriltag_params.get("wiener_psf_radius", 2.0)),
-            noise_level=float(apriltag_params.get("wiener_noise_level", 0.01)),
-        )
-
-    if apriltag_params.get("use_unsharp", True):
-        ks = apriltag_params["kernel_size"]
-        if isinstance(ks, int):
-            ks = (ks, ks)
-        sharp = unsharp_mask(
-            img,
-            kernel_size=ks,
-            sigma=apriltag_params["sigma"],
-            amount=apriltag_params["amount"],
-        )
+    if apriltag_params.get("no_enhance", False):
+        # Skip every sharpening / contrast / pre-processing stage and run the
+        # detector directly on the raw grayscale crop.
+        enhanced = img
     else:
-        sharp = img
+        # Optional pre-stages (no-ops unless the preset enables them)
+        if apriltag_params.get("invert", False):
+            from yoto.image_processing import invert as _invert
 
-    contrast_method = apriltag_params.get("contrast_method", "simple")
-    if contrast_method == "cv2":
-        enhanced = contrast_enhance_cv2(
-            sharp,
-            alpha=apriltag_params["cv2_alpha"],
-            beta=apriltag_params["cv2_beta"],
-        )
-    else:
-        enhanced = contrast_enhance_pil(
-            sharp, factor=apriltag_params["contrast_factor"]
-        )
+            img = _invert(img)
+
+        upscale_factor = float(apriltag_params.get("upscale", 1.0))
+        if upscale_factor != 1.0:
+            from yoto.image_processing import upscale as _upscale
+
+            img = _upscale(
+                img,
+                factor=upscale_factor,
+                interp=apriltag_params.get("upscale_interp", "lanczos"),
+            )
+
+        tone = apriltag_params.get("tone_map", "none")
+        if tone and tone != "none":
+            from yoto.image_processing import tone_map as _tone_map
+
+            img = _tone_map(img, method=tone)
+
+        if apriltag_params.get("use_gamma", False):
+            from yoto.image_processing import gamma_correct
+
+            img = gamma_correct(img, gamma=float(apriltag_params.get("gamma", 1.0)))
+
+        if apriltag_params.get("use_median_blur", False):
+            # key "median_ksize" matches the optimizer output; "median_kernel" is legacy
+            k = int(
+                apriltag_params.get(
+                    "median_ksize", apriltag_params.get("median_kernel", 3)
+                )
+            )
+            if k % 2 == 0:
+                k += 1
+            img = cv2.medianBlur(img, k)
+
+        if apriltag_params.get("use_bilateral", False):
+            img = cv2.bilateralFilter(
+                img,
+                d=int(apriltag_params.get("bilateral_d", 5)),
+                sigmaColor=float(apriltag_params.get("bilateral_sigma_color", 50.0)),
+                sigmaSpace=float(apriltag_params.get("bilateral_sigma_space", 50.0)),
+            )
+
+        if apriltag_params.get("use_wiener", False):
+            img = wiener_deconvolve(
+                img,
+                psf_radius=float(apriltag_params.get("wiener_psf_radius", 2.0)),
+                noise_level=float(apriltag_params.get("wiener_noise_level", 0.01)),
+            )
+
+        if apriltag_params.get("use_unsharp", False):
+            ks = apriltag_params.get("kernel_size", DEFAULT_UNSHARP_KERNEL)
+            if isinstance(ks, int):
+                ks = (ks, ks)
+            sharp = unsharp_mask(
+                img,
+                kernel_size=ks,
+                sigma=apriltag_params.get("sigma", DEFAULT_UNSHARP_SIGMA),
+                amount=apriltag_params.get("amount", DEFAULT_UNSHARP_AMOUNT),
+            )
+        else:
+            sharp = img
+
+        contrast_method = apriltag_params.get("contrast_method", "simple")
+        if contrast_method == "cv2":
+            enhanced = contrast_enhance_cv2(
+                sharp,
+                alpha=apriltag_params["cv2_alpha"],
+                beta=apriltag_params["cv2_beta"],
+            )
+        elif contrast_method == "clahe":
+            clahe = cv2.createCLAHE(
+                clipLimit=float(apriltag_params.get("clahe_clip", 2.0)),
+                tileGridSize=(
+                    int(apriltag_params.get("clahe_grid", 8)),
+                    int(apriltag_params.get("clahe_grid", 8)),
+                ),
+            )
+            enhanced = clahe.apply(sharp)
+        elif contrast_method == "adaptive":
+            block = int(apriltag_params.get("adapt_block", 21))
+            if block % 2 == 0:
+                block += 1
+            method_flag = (
+                cv2.ADAPTIVE_THRESH_GAUSSIAN_C
+                if apriltag_params.get("adapt_gaussian", True)
+                else cv2.ADAPTIVE_THRESH_MEAN_C
+            )
+            enhanced = cv2.adaptiveThreshold(
+                sharp,
+                255,
+                method_flag,
+                cv2.THRESH_BINARY,
+                block,
+                int(apriltag_params.get("adapt_C", 5)),
+            )
+        elif contrast_method == "none":
+            enhanced = sharp
+        else:  # "simple" or unknown
+            enhanced = contrast_enhance_pil(
+                sharp,
+                factor=apriltag_params.get("contrast_factor", DEFAULT_CONTRAST_FACTOR),
+            )
 
     tags: list[dict[str, Any]] = detector.detect(enhanced)
 
@@ -393,53 +441,53 @@ def _reproject_tags(
     canvas_x_offsets: list[int],
     offsets_xy: list[tuple[int, int]],
     boxes_np: BBoxArray,
-    frame_dict: dict[tuple[Any, str], Any],
+    frame_idx: int,
     max_offset_ratio: float = DEFAULT_MAX_TAG_OFFSET_RATIO,
     max_tag_id: int = MAX_VALID_TAG_ID,
     silence_ids: np.ndarray[Any, np.dtype[np.int64]] | None = None,
-) -> dict[int, int]:
+) -> tuple[dict[int, int], list[dict[str, Any]]]:
     """Map tag coordinates from the composite strip back to the full frame.
 
     For each decoded tag, bucket it back to its source YOLO crop via the
     composite x-coordinate, reproject the tag center and corners into
-    full-frame coordinates, and stamp them into ``frame_dict``.
+    full-frame coordinates, and append a detection row.  All detections
+    are kept, including duplicate tag IDs (two YOLO crops decoding to the
+    same ID); the raw long-format pkl preserves every row so the user can
+    inspect them.
 
-    Reject the tag (don't stamp anything) if:
+    Reject a tag if:
       * ``tag_id > max_tag_id`` — outside the family range.
       * The reprojected center is farther from the source YOLO box's
-        center than ``max_offset_ratio * min(box_w, box_h)``.  This
-        catches AprilTag misdecodes that lock onto a quad in the
-        padding region rather than the actual tag — the resulting
-        ``tag_id`` is unreliable and would corrupt the trajectory.
+        center than ``max_offset_ratio * min(box_w, box_h)``.
 
     Parameters
     ----------
     tags : list[dict[str, Any]]
         Raw detections from AprilTag.
-    crops : list[ndarray]
-        Individual padded crop arrays (one per YOLO box, in input order).
+    crop_shapes : list[tuple[int, int]]
+        (height, width) of each padded crop.
     canvas_x_offsets : list[int]
         X-offset of each crop in the composite strip.
     offsets_xy : list[tuple[int, int]]
         Top-left corner of each crop in the original frame.
     boxes_np : BBoxArray
-        Original (unpadded) YOLO boxes ``(N, 4)`` xyxy in frame coords —
-        used for the box-center distance check.
-    frame_dict : dict
-        Mutable dict accumulating results for this frame.
+        Original (unpadded) YOLO boxes ``(N, 4)`` xyxy in frame coords.
+    frame_idx : int
+        Frame number, stamped into every returned detection row.
     max_offset_ratio : float
         Maximum allowed tag-to-box-center distance, as a fraction of
         ``min(box_w, box_h)``.
 
     Returns
     -------
-    dict[int, int]
-        Map ``crop_idx -> tag_id`` for accepted decodes only.  Used
-        downstream to (a) filter raw quads and (b) stamp ``tag_id`` /
-        ``decoded`` columns on the ``_yolo.pkl`` sidecar.
+    tuple[dict[int, int], list[dict[str, Any]]]
+        ``(decoded, detection_rows)`` where ``decoded`` maps
+        ``crop_idx -> tag_id`` for accepted decodes and ``detection_rows``
+        is one dict per accepted detection with keys
+        ``frame``, ``tag_id``, ``center_x``, ``center_y``, ``corners``.
     """
     if not tags or not crop_shapes:
-        return {}
+        return {}, []
 
     n_crops = len(crop_shapes)
     cum_widths = np.cumsum([s[1] for s in crop_shapes])
@@ -457,13 +505,12 @@ def _reproject_tags(
 
     # Mask: keep tags whose center landed inside a crop and whose id is
     # in the valid family range.  Out-of-bounds indices get clamped to
-    # 0 for safe array lookups below — their ``valid`` slot stays False
-    # so they never reach ``frame_dict``.
+    # 0 for safe array lookups below — their ``valid`` slot stays False.
     valid = (crop_idxs < n_crops) & (tag_ids_arr <= max_tag_id)
     if silence_ids is not None and silence_ids.size:
         valid &= ~np.isin(tag_ids_arr, silence_ids)
     if not valid.any():
-        return {}
+        return {}, []
     safe_idxs = np.where(valid, crop_idxs, 0)
 
     # Vectorized center reprojection to frame coordinates.
@@ -485,7 +532,7 @@ def _reproject_tags(
         dy = abs_ys - box_cy[safe_idxs]
         valid &= (dx * dx + dy * dy) <= thresh_sq[safe_idxs]
         if not valid.any():
-            return {}
+            return {}, []
 
     # Vectorized corner reprojection.  Stack to (N, 4, 2), then add the
     # per-tag x/y offset broadcast across the 4 corners.
@@ -497,10 +544,11 @@ def _reproject_tags(
     all_corners[:, :, 0] += x_offs[:, np.newaxis]
     all_corners[:, :, 1] += y_offs[:, np.newaxis]
 
-    # Final write loop.  Dict assignment is inherently per-key, but
-    # every scalar is pre-converted via ``.tolist()`` so the inner body
-    # has zero numpy overhead.
+    # Final collection loop.  Every accepted detection becomes a row dict;
+    # duplicate tag IDs are kept (multiple rows for the same tag_id in the
+    # same frame) so the raw long-format pkl preserves all detections.
     decoded: dict[int, int] = {}
+    detection_rows: list[dict[str, Any]] = []
     abs_xs_list = abs_xs.tolist()
     abs_ys_list = abs_ys.tolist()
     crop_idxs_list = safe_idxs.tolist()
@@ -509,12 +557,18 @@ def _reproject_tags(
     for i in accepted:
         crop_idx = crop_idxs_list[i]
         tag_id = tag_ids_list[i]
-        frame_dict[(tag_id, COL_CENTER_X)] = abs_xs_list[i]
-        frame_dict[(tag_id, COL_CENTER_Y)] = abs_ys_list[i]
-        frame_dict[(tag_id, COL_CORNERS)] = all_corners[i]
+        detection_rows.append(
+            {
+                COL_FRAME: frame_idx,
+                "tag_id": tag_id,
+                COL_CENTER_X: abs_xs_list[i],
+                COL_CENTER_Y: abs_ys_list[i],
+                COL_CORNERS: all_corners[i],
+            }
+        )
         decoded[crop_idx] = tag_id
 
-    return decoded
+    return decoded, detection_rows
 
 
 def _filter_and_reproject_quads(
@@ -618,7 +672,7 @@ def _process_frame_cpu(
     save_yolo: bool = True,
     save_quads: bool = False,
 ) -> tuple[
-    dict[tuple[Any, str], Any],
+    list[dict[str, Any]],
     list[dict[str, Any]],
     list[dict[str, Any]],
 ]:
@@ -630,34 +684,34 @@ def _process_frame_cpu(
     Returns
     -------
     tuple
-        ``(frame_dict, quad_rows, all_yolo_rows)``.  ``frame_dict`` has
-        ``(tag_id, metric)`` keys for decoded tags; ``quad_rows`` lists
+        ``(detection_rows, quad_rows, all_yolo_rows)``.  ``detection_rows``
+        is one dict per accepted AprilTag decode with keys
+        ``frame``, ``tag_id``, ``center_x``, ``center_y``, ``corners`` —
+        duplicate tag IDs are kept as separate rows; ``quad_rows`` lists
         surviving raw AprilTag quads from undecoded crops;
         ``all_yolo_rows`` lists *every* YOLO box with its confidence,
         a ``decoded`` flag, and the resulting ``tag_id`` (``-1`` when
         undecoded).  The undecoded subset of ``all_yolo_rows`` is the
         YOLO-fill source consumed by ``yoto clean``.
     """
-    frame_dict: dict[tuple[Any, str], Any] = {(COL_FRAME, ""): frame_idx}
-
     crops, offsets_xy, composite_gray, canvas_x_offsets = _crop_and_pack(
         frame, boxes_np, pad_ratio
     )
 
     if composite_gray is None:
-        return frame_dict, [], []
+        return [], [], []
 
     tags, raw_quads = _enhance_and_detect(
         composite_gray, apriltag_params, detector, save_quads=save_quads
     )
     crop_shapes = [c.shape[:2] for c in crops]
-    decoded_tag_ids = _reproject_tags(
+    decoded_tag_ids, detection_rows = _reproject_tags(
         tags,
         crop_shapes,
         canvas_x_offsets,
         offsets_xy,
         boxes_np,
-        frame_dict,
+        frame_idx,
         max_offset_ratio=max_offset_ratio,
         max_tag_id=max_tag_id,
         silence_ids=silence_ids,
@@ -682,7 +736,7 @@ def _process_frame_cpu(
             boxes_np, confs_np, decoded_tag_ids, frame_idx
         )
 
-    return frame_dict, quad_rows, all_yolo_rows
+    return detection_rows, quad_rows, all_yolo_rows
 
 
 def _process_frame_full(
@@ -690,34 +744,41 @@ def _process_frame_full(
     frame: ImageType,
     apriltag_params: dict[str, Any],
     detector: Any,
-) -> dict[tuple[Any, str], Any]:
+    max_tag_id: int = MAX_VALID_TAG_ID,
+) -> list[dict[str, Any]]:
     """Run AprilTag detection on the full frame without YOLO cropping.
 
     Used by the ``no_yolo`` path in both video and image detection.
+    Returns one dict per detection; duplicate tag IDs are kept as
+    separate rows.
     """
-    frame_dict: dict[tuple[Any, str], Any] = {(COL_FRAME, ""): frame_idx}
-
     gray: GrayImage = (
         cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
     )
     tags, _ = _enhance_and_detect(gray, apriltag_params, detector, save_quads=False)
 
+    detection_rows: list[dict[str, Any]] = []
     for tag in tags:
         tag_id: int = tag["id"]
-        if tag_id > MAX_VALID_TAG_ID:
+        if tag_id > max_tag_id:
             continue
         cx, cy = tag["center"]
-        frame_dict[(tag_id, COL_CENTER_X)] = cx
-        frame_dict[(tag_id, COL_CENTER_Y)] = cy
-        frame_dict[(tag_id, COL_CORNERS)] = tag["lb-rb-rt-lt"].copy()
-
-    return frame_dict
+        detection_rows.append(
+            {
+                COL_FRAME: frame_idx,
+                "tag_id": tag_id,
+                COL_CENTER_X: cx,
+                COL_CENTER_Y: cy,
+                COL_CORNERS: tag["lb-rb-rt-lt"].copy(),
+            }
+        )
+    return detection_rows
 
 
 def _draw_image_overlay(
     image: ImageType,
     boxes_np: BBoxArray,
-    frame_dict: dict[tuple[Any, str], Any],
+    detection_rows: list[dict[str, Any]],
 ) -> np.ndarray[Any, np.dtype[np.uint8]]:
     """Draw YOLO boxes and AprilTag detections onto *image*, return BGR result."""
     out: np.ndarray[Any, np.dtype[np.uint8]] = (
@@ -728,13 +789,13 @@ def _draw_image_overlay(
         x1, y1, x2, y2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
         cv2.rectangle(out, (x1, y1), (x2, y2), (255, 100, 0), 2)
 
-    tag_ids = {k[0] for k in frame_dict if k[0] != COL_FRAME}
-    for tag_id in tag_ids:
-        cx = frame_dict.get((tag_id, COL_CENTER_X))
-        cy = frame_dict.get((tag_id, COL_CENTER_Y))
-        corners = frame_dict.get((tag_id, COL_CORNERS))
+    for row in detection_rows:
+        tag_id = row["tag_id"]
+        cx = row.get(COL_CENTER_X)
+        cy = row.get(COL_CENTER_Y)
+        corners = row.get(COL_CORNERS)
         if corners is not None:
-            pts = corners.astype(int).reshape(-1, 1, 2)
+            pts = np.asarray(corners).astype(int).reshape(-1, 1, 2)
             cv2.polylines(out, [pts], isClosed=True, color=(0, 200, 255), thickness=2)
         if cx is not None and cy is not None:
             ix, iy = int(cx), int(cy)
@@ -769,7 +830,7 @@ def _process_frame_precomposited(
     save_yolo: bool = True,
     save_quads: bool = False,
 ) -> tuple[
-    dict[tuple[Any, str], Any],
+    list[dict[str, Any]],
     list[dict[str, Any]],
     list[dict[str, Any]],
 ]:
@@ -778,21 +839,19 @@ def _process_frame_precomposited(
     Same outputs as :func:`_process_frame_cpu`; skips :func:`_crop_and_pack`
     because the composite and layout metadata are precomputed upstream.
     """
-    frame_dict: dict[tuple[Any, str], Any] = {(COL_FRAME, ""): frame_idx}
-
     if composite_gray is None:
-        return frame_dict, [], []
+        return [], [], []
 
     tags, raw_quads = _enhance_and_detect(
         composite_gray, apriltag_params, detector, save_quads=save_quads
     )
-    decoded_tag_ids = _reproject_tags(
+    decoded_tag_ids, detection_rows = _reproject_tags(
         tags,
         crop_shapes,
         canvas_x_offsets,
         offsets_xy,
         boxes_np,
-        frame_dict,
+        frame_idx,
         max_offset_ratio=max_offset_ratio,
         max_tag_id=max_tag_id,
         silence_ids=silence_ids,
@@ -817,7 +876,7 @@ def _process_frame_precomposited(
             boxes_np, confs_np, decoded_tag_ids, frame_idx
         )
 
-    return frame_dict, quad_rows, all_yolo_rows
+    return detection_rows, quad_rows, all_yolo_rows
 
 
 # ---------------------------------------------------------------------------
@@ -1395,11 +1454,6 @@ def _stamp_attrs(
         df.attrs.update(extra)
 
 
-DEFAULT_WEIGHTS = os.path.normpath(
-    os.path.join(os.path.dirname(__file__), "..", "..", "models", "detect34.pt")
-)
-
-
 def _save_sidecar(
     rows: list[dict[str, Any]],
     main_pkl: str,
@@ -1456,6 +1510,7 @@ def run_detection_simple(
     max_tag_id: int | None = None,
     silence_ids: list[int] | None = None,
     no_yolo: bool = False,
+    no_enhance: bool = False,
 ) -> pd.DataFrame:
     """Run the simple (portable) YOLO + AprilTag detection pipeline.
 
@@ -1468,8 +1523,9 @@ def run_detection_simple(
     video_path : str
         Path to the input video file.
     output_path : str | None
-        Directory for the output pickle.  When ``None`` the pickle is
-        written next to the input video.
+        Directory for the output pickle.  When ``None`` (default) the
+        pickle is written to ``<video_parent>/tracking/raw_data/``,
+        matching the behaviour of ``yoto detect``.
     yolo_weights : str
         Path to YOLO weights (``.engine`` or ``.pt``).
     data_suffix : str
@@ -1504,17 +1560,22 @@ def run_detection_simple(
         from yoto.apriltag_presets import load_preset, merge_preset
 
         apriltag_params = merge_preset(apriltag_params, load_preset(preset))
+    if no_enhance:
+        apriltag_params["no_enhance"] = True
 
     if num_frames is None:
         num_frames = _probe_frame_count(video_path)
 
-    # Resolve output path
-    if output_path:
-        os.makedirs(output_path, exist_ok=True)
-        video_basename = os.path.basename(video_path).rsplit(".", 1)[0]
-        out_pkl = os.path.join(output_path, video_basename + data_suffix + ".pkl")
-    else:
-        out_pkl = video_path.rsplit(".", 1)[0] + data_suffix + ".pkl"
+    # Resolve output path — default mirrors `yoto detect`: <recording>/tracking/raw_data/
+    video_basename = os.path.basename(video_path).rsplit(".", 1)[0]
+    if output_path is None:
+        output_path = os.path.join(
+            os.path.dirname(os.path.abspath(video_path)),
+            TRACKING_DIR,
+            TRACKING_SUBDIRS["raw_data"],
+        )
+    os.makedirs(output_path, exist_ok=True)
+    out_pkl = os.path.join(output_path, video_basename + data_suffix + ".pkl")
 
     start_time = time.time()
 
@@ -1544,8 +1605,8 @@ def run_detection_simple(
                 ret, frame = cap.read()
                 if not ret:
                     break
-                results_tag.append(
-                    _process_frame_full(i, frame, apriltag_params, detector)
+                results_tag.extend(
+                    _process_frame_full(i, frame, apriltag_params, detector, max_tag_id)
                 )
                 status_update(i + 1)
         finally:
@@ -1581,7 +1642,7 @@ def run_detection_simple(
             confs_np = result.boxes.conf.cpu().numpy() if save_yolo else None
             frame_height, frame_width = frame.shape[0], frame.shape[1]
 
-            frame_dict, quad_rows, yolo_rows = _process_frame_cpu(
+            detection_rows, quad_rows, yolo_rows = _process_frame_cpu(
                 i,
                 frame,
                 boxes_np,
@@ -1597,7 +1658,7 @@ def run_detection_simple(
                 save_yolo=save_yolo,
                 save_quads=save_quads,
             )
-            results_tag.append(frame_dict)
+            results_tag.extend(detection_rows)
             if save_quads:
                 quads_all.extend(quad_rows)
             if save_yolo:
@@ -1605,15 +1666,20 @@ def run_detection_simple(
             status_update(i + 1)
         yolo_results.close()
 
-    # Build DataFrame
-    df = pd.DataFrame(results_tag)
-    df.columns = pd.MultiIndex.from_tuples(df.columns)
-    df = df.set_index(COL_FRAME)
+    # Build long-format DataFrame (one row per detection, duplicate tag IDs kept)
+    if results_tag:
+        df = pd.DataFrame(results_tag).set_index(COL_FRAME)
+    else:
+        df = pd.DataFrame(
+            columns=["tag_id", COL_CENTER_X, COL_CENTER_Y, COL_CORNERS]
+        ).rename_axis(COL_FRAME)
     pipeline_label = "simple_noyolo" if no_yolo else "simple"
     extra: dict[str, Any] = {
         "yoto_preset": preset,
         "yoto_tag_family": tag_family,
         "yoto_max_tag_id": max_tag_id,
+        "yoto_no_enhance": no_enhance,
+        "yoto_n_frames": num_frames,
     }
     if not no_yolo:
         extra.update(
@@ -1677,6 +1743,7 @@ def run_detection_images(
     tag_family: str = DEFAULT_TAG_FAMILY,
     max_tag_id: int | None = None,
     no_yolo: bool = False,
+    no_enhance: bool = False,
 ) -> list[pd.DataFrame]:
     """Run YOLO + AprilTag detection on a single image or a folder of images.
 
@@ -1725,6 +1792,8 @@ def run_detection_images(
         from yoto.apriltag_presets import load_preset, merge_preset
 
         apriltag_params = merge_preset(apriltag_params, load_preset(preset))
+    if no_enhance:
+        apriltag_params["no_enhance"] = True
 
     if max_tag_id is None:
         max_tag_id = default_max_tag_id_for_family(tag_family)
@@ -1775,7 +1844,9 @@ def run_detection_images(
 
         if no_yolo:
             boxes_np = np.zeros((0, 4), dtype=np.float32)
-            frame_dict = _process_frame_full(0, img_bgr, apriltag_params, detector)
+            detection_rows = _process_frame_full(
+                0, img_bgr, apriltag_params, detector, max_tag_id
+            )
         else:
             assert seg_model is not None
             yolo_results = list(
@@ -1788,7 +1859,7 @@ def run_detection_images(
                 )
             )
             boxes_np = yolo_results[0].boxes.xyxy.cpu().numpy()
-            frame_dict, _, _ = _process_frame_cpu(
+            detection_rows, _, _ = _process_frame_cpu(
                 0,
                 img_bgr,
                 boxes_np,
@@ -1804,20 +1875,25 @@ def run_detection_images(
             )
 
         # Write overlay
-        overlay = _draw_image_overlay(img_bgr, boxes_np, frame_dict)
+        overlay = _draw_image_overlay(img_bgr, boxes_np, detection_rows)
         overlay_path = os.path.join(overlay_dir, f"{stem}{data_suffix}_overlay.png")
         cv2.imwrite(overlay_path, overlay)
         logger.info("Overlay: %s", overlay_path)
 
-        # Build single-row DataFrame and pickle
-        df = pd.DataFrame([frame_dict])
-        df.columns = pd.MultiIndex.from_tuples(df.columns)
-        df = df.set_index(COL_FRAME)
+        # Build long-format DataFrame and pickle (one row per detection)
+        if detection_rows:
+            df = pd.DataFrame(detection_rows).set_index(COL_FRAME)
+        else:
+            df = pd.DataFrame(
+                columns=["tag_id", COL_CENTER_X, COL_CENTER_Y, COL_CORNERS]
+            ).rename_axis(COL_FRAME)
         img_extra: dict[str, Any] = {
             "yoto_preset": preset,
             "yoto_source_image": img_path,
             "yoto_tag_family": tag_family,
             "yoto_max_tag_id": max_tag_id,
+            "yoto_no_enhance": no_enhance,
+            "yoto_n_frames": 1,
         }
         if not no_yolo:
             img_extra["yoto_yolo_weights"] = yolo_weights
@@ -1852,6 +1928,7 @@ def run_detection_fast(
     tag_family: str = DEFAULT_TAG_FAMILY,
     max_tag_id: int | None = None,
     silence_ids: list[int] | None = None,
+    no_enhance: bool = False,
 ) -> pd.DataFrame:
     """Run the fast (NVDEC) YOLO + AprilTag detection pipeline.
 
@@ -1864,8 +1941,9 @@ def run_detection_fast(
     video_path : str
         Path to the input video file.
     output_path : str | None
-        Directory for the output pickle.  When ``None`` the pickle is
-        written next to the input video.
+        Directory for the output pickle.  When ``None`` (default) the
+        pickle is written to ``<video_parent>/tracking/raw_data/``,
+        matching the behaviour of ``yoto detect``.
     yolo_weights : str
         Path to YOLO weights (``.engine`` or ``.pt``).
     data_suffix : str
@@ -1907,17 +1985,22 @@ def run_detection_fast(
         from yoto.apriltag_presets import load_preset, merge_preset
 
         apriltag_params = merge_preset(apriltag_params, load_preset(preset))
+    if no_enhance:
+        apriltag_params["no_enhance"] = True
 
     if num_frames is None:
         num_frames = _probe_frame_count(video_path)
 
-    # Resolve output path
-    if output_path:
-        os.makedirs(output_path, exist_ok=True)
-        video_basename = os.path.basename(video_path).rsplit(".", 1)[0]
-        out_pkl = os.path.join(output_path, video_basename + data_suffix + ".pkl")
-    else:
-        out_pkl = video_path.rsplit(".", 1)[0] + data_suffix + ".pkl"
+    # Resolve output path — default mirrors `yoto detect`: <recording>/tracking/raw_data/
+    video_basename = os.path.basename(video_path).rsplit(".", 1)[0]
+    if output_path is None:
+        output_path = os.path.join(
+            os.path.dirname(os.path.abspath(video_path)),
+            TRACKING_DIR,
+            TRACKING_SUBDIRS["raw_data"],
+        )
+    os.makedirs(output_path, exist_ok=True)
+    out_pkl = os.path.join(output_path, video_basename + data_suffix + ".pkl")
 
     start_time = time.time()
 
@@ -2034,8 +2117,8 @@ def run_detection_fast(
 
         # Back-pressure: drain oldest futures before queueing more
         while len(pending) >= max_inflight:
-            fd, qr, yr = pending.popleft().result()
-            results_tag.append(fd)
+            dr, qr, yr = pending.popleft().result()
+            results_tag.extend(dr)
             if save_quads:
                 quads_all.extend(qr)
             if save_yolo:
@@ -2044,8 +2127,8 @@ def run_detection_fast(
 
     # Drain remaining futures
     while pending:
-        fd, qr, yr = pending.popleft().result()
-        results_tag.append(fd)
+        dr, qr, yr = pending.popleft().result()
+        results_tag.extend(dr)
         if save_quads:
             quads_all.extend(qr)
         if save_yolo:
@@ -2091,10 +2174,13 @@ def run_detection_fast(
             1000.0 / max(cpu_mean_ms, 1e-9),
         )
 
-    # Build DataFrame
-    df = pd.DataFrame(results_tag)
-    df.columns = pd.MultiIndex.from_tuples(df.columns)
-    df = df.set_index(COL_FRAME)
+    # Build long-format DataFrame (one row per detection, duplicate tag IDs kept)
+    if results_tag:
+        df = pd.DataFrame(results_tag).set_index(COL_FRAME)
+    else:
+        df = pd.DataFrame(
+            columns=["tag_id", COL_CENTER_X, COL_CENTER_Y, COL_CORNERS]
+        ).rename_axis(COL_FRAME)
     _stamp_attrs(
         df,
         video_path,
@@ -2104,8 +2190,10 @@ def run_detection_fast(
             "yoto_preset": preset,
             "yoto_tag_family": tag_family,
             "yoto_max_tag_id": max_tag_id,
+            "yoto_no_enhance": no_enhance,
             "yoto_silence_ids": list(silence_ids) if silence_ids else [],
             "yoto_pad_ratio": pad_ratio,
+            "yoto_n_frames": effective_frames,
         },
     )
     df.to_pickle(out_pkl)

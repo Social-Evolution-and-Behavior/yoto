@@ -172,7 +172,7 @@ yoto detect /path/to/frame.jpg --yoloweights /path/to/yolo.pt --no-yolo True
 2. **Crop layout** — padding bounds are computed for each box (`pad_ratio × box_dim`, capped at `pad_ratio × median(box_dim)` to prevent outliers from inflating crops)
 3. **GPU composite** — in the fast pipeline, crops are assembled into a single wide strip directly on GPU (zero CPU copy); the simple pipeline does this on CPU
 4. **Image enhancement** — unsharp masking and contrast boosting
-5. **AprilTag decoding** — the SEBLab detector runs once on the composite (parameters configurable via a preset; see above)
+5. **AprilTag decoding** — the apriltag detector runs once on the composite (parameters configurable via a preset; see above)
 6. **Reprojection + offset filter** — tag coordinates are mapped back to the original frame; decodes whose center is farther than `max_tag_offset_ratio × min(box_w, box_h)` from the source YOLO box center are dropped (catches misdecodes in padding regions). Disable with `--tag-offset-filter False`.
 
 ## Output Format

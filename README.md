@@ -1,11 +1,20 @@
-[![CI](https://github.com/Social-Evolution-and-Behavior/yoto/actions/workflows/ci.yml/badge.svg)](https://github.com/Social-Evolution-and-Behavior/yoto/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/Social-Evolution-and-Behavior/yoto?include_prereleases&sort=semver)](https://github.com/Social-Evolution-and-Behavior/yoto/releases)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/YOTO-LOGO-W.png">
+    <img src="docs/assets/YOTO-LOGO.png" alt="YOTO logo" width="280">
+  </picture>
+</p>
 
-# YOTO
+<h1 align="center">YOTO</h1>
 
-GPU-accelerated AprilTag tracking pipeline for ant behavioral studies.
+<p align="center">GPU-accelerated AprilTag tracking pipeline for ant behavioral studies.</p>
+
+<p align="center">
+  <a href="https://github.com/Social-Evolution-and-Behavior/yoto/actions/workflows/ci.yml"><img src="https://github.com/Social-Evolution-and-Behavior/yoto/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/Social-Evolution-and-Behavior/yoto/releases"><img src="https://img.shields.io/github/v/release/Social-Evolution-and-Behavior/yoto?include_prereleases&sort=semver" alt="Release"></a>
+  <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a>
+  <a href="https://github.com/psf/black"><img src="https://img.shields.io/badge/code%20style-black-000000.svg" alt="Code style: black"></a>
+</p>
 
 YOTO is a hybrid pipeline for fast and reliable tracking of fiducial-marked insects. Running AprilTag directly on a high-resolution video frame is slow, because the decoder scans the whole image looking for quads. YOTO splits the work into two stages and only runs the expensive decoder on the parts of the frame that matter:
 

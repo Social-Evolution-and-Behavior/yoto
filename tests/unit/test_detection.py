@@ -13,6 +13,7 @@ from yoto.detection import (
     _build_apriltag_params_fast,
     _build_apriltag_params_simple,
     _crop_and_pack,
+    _enhance_and_detect,
     _process_frame_cpu,
     _reproject_tags,
 )
@@ -46,6 +47,38 @@ class TestBuildApriltagParams:
         params = _build_apriltag_params_fast()
         assert "cv2_alpha" in params
         assert "cv2_beta" in params
+
+    @pytest.mark.parametrize(
+        "builder", [_build_apriltag_params_simple, _build_apriltag_params_fast]
+    )
+    def test_default_preset_applies_unsharp(self, builder: Any) -> None:
+        """Regression guard: the default presets must enable the unsharp mask.
+
+        Both builders set ``kernel_size``/``sigma``/``amount`` but historically
+        relied on ``use_unsharp`` defaulting to True. When that code default was
+        flipped to False the built-in presets silently stopped sharpening,
+        dropping the raw AprilTag decode rate (~58% -> ~42% on the IUSSI
+        recording). This asserts the enhancement actually reaches the detector.
+        """
+        params = builder()
+        assert params.get("use_unsharp") is True
+
+        # A textured image so unsharp_mask actually changes pixels.
+        yy, xx = np.mgrid[0:64, 0:64]
+        img = ((xx * 4 + yy * 2) % 256).astype(np.uint8)
+
+        captured: list[np.ndarray[Any, np.dtype[np.uint8]]] = []
+
+        class _CaptureDetector:
+            def detect(self, image: Any) -> list[dict[str, Any]]:
+                captured.append(np.array(image))
+                return []
+
+        _enhance_and_detect(img, dict(params), _CaptureDetector())
+        _enhance_and_detect(img, {**params, "use_unsharp": False}, _CaptureDetector())
+
+        with_unsharp, without_unsharp = captured
+        assert not np.array_equal(with_unsharp, without_unsharp)
 
 
 class TestCropAndPack:
@@ -137,8 +170,6 @@ class TestReprojectTags:
         canvas_x_offsets = [0]
         offsets_xy = [(100, 200)]
         boxes_np = np.array([[115.0, 213.0, 145.0, 238.0]], dtype=np.float64)
-        frame_dict: dict[tuple[Any, str], Any] = {}
-
         tags = [
             {
                 "id": 5,
@@ -149,25 +180,22 @@ class TestReprojectTags:
             }
         ]
 
-        decoded = _reproject_tags(
-            tags, crop_shapes, canvas_x_offsets, offsets_xy, boxes_np, frame_dict
+        decoded, rows = _reproject_tags(
+            tags, crop_shapes, canvas_x_offsets, offsets_xy, boxes_np, frame_idx=0
         )
 
         assert decoded == {0: 5}
-        assert (5, COL_CENTER_X) in frame_dict
-        assert (5, COL_CENTER_Y) in frame_dict
-        assert (5, COL_CORNERS) in frame_dict
+        assert len(rows) == 1
+        assert rows[0]["tag_id"] == 5
         # Absolute position: x_off + (cx - crop_x0) = 100 + (30 - 0) = 130
-        assert frame_dict[(5, COL_CENTER_X)] == pytest.approx(130.0)
-        assert frame_dict[(5, COL_CENTER_Y)] == pytest.approx(225.0)
+        assert rows[0][COL_CENTER_X] == pytest.approx(130.0)
+        assert rows[0][COL_CENTER_Y] == pytest.approx(225.0)
 
     def test_tag_above_max_id_ignored(self) -> None:
         crop_shapes = [(50, 60)]
         canvas_x_offsets = [0]
         offsets_xy = [(0, 0)]
         boxes_np = np.array([[0.0, 0.0, 60.0, 50.0]], dtype=np.float64)
-        frame_dict: dict[tuple[Any, str], Any] = {}
-
         tags = [
             {
                 "id": 999,  # above MAX_VALID_TAG_ID
@@ -178,11 +206,11 @@ class TestReprojectTags:
             }
         ]
 
-        decoded = _reproject_tags(
-            tags, crop_shapes, canvas_x_offsets, offsets_xy, boxes_np, frame_dict
+        decoded, rows = _reproject_tags(
+            tags, crop_shapes, canvas_x_offsets, offsets_xy, boxes_np, frame_idx=0
         )
         assert decoded == {}
-        assert len(frame_dict) == 0
+        assert rows == []
 
     def test_tag_far_from_box_center_dropped(self) -> None:
         # YOLO box at frame (100, 200)–(140, 240): 40×40, centre (120, 220).
@@ -195,8 +223,6 @@ class TestReprojectTags:
         canvas_x_offsets = [0]
         offsets_xy = [(90, 190)]
         boxes_np = np.array([[100.0, 200.0, 140.0, 240.0]], dtype=np.float64)
-        frame_dict: dict[tuple[Any, str], Any] = {}
-
         tags = [
             {
                 "id": 7,
@@ -207,11 +233,11 @@ class TestReprojectTags:
             }
         ]
 
-        decoded = _reproject_tags(
-            tags, crop_shapes, canvas_x_offsets, offsets_xy, boxes_np, frame_dict
+        decoded, rows = _reproject_tags(
+            tags, crop_shapes, canvas_x_offsets, offsets_xy, boxes_np, frame_idx=0
         )
         assert decoded == {}
-        assert len(frame_dict) == 0
+        assert rows == []
 
     def test_tag_near_box_center_accepted(self) -> None:
         # Same setup but tag at composite-center (30, 30) → frame (120, 220),
@@ -220,8 +246,6 @@ class TestReprojectTags:
         canvas_x_offsets = [0]
         offsets_xy = [(90, 190)]
         boxes_np = np.array([[100.0, 200.0, 140.0, 240.0]], dtype=np.float64)
-        frame_dict: dict[tuple[Any, str], Any] = {}
-
         tags = [
             {
                 "id": 7,
@@ -232,12 +256,13 @@ class TestReprojectTags:
             }
         ]
 
-        decoded = _reproject_tags(
-            tags, crop_shapes, canvas_x_offsets, offsets_xy, boxes_np, frame_dict
+        decoded, rows = _reproject_tags(
+            tags, crop_shapes, canvas_x_offsets, offsets_xy, boxes_np, frame_idx=0
         )
         assert decoded == {0: 7}
-        assert frame_dict[(7, COL_CENTER_X)] == pytest.approx(120.0)
-        assert frame_dict[(7, COL_CENTER_Y)] == pytest.approx(220.0)
+        assert len(rows) == 1
+        assert rows[0][COL_CENTER_X] == pytest.approx(120.0)
+        assert rows[0][COL_CENTER_Y] == pytest.approx(220.0)
 
 
 class TestProcessFrameCpu:
@@ -250,7 +275,7 @@ class TestProcessFrameCpu:
         params = _build_apriltag_params_simple()
         mock_detector = MagicMock()
 
-        frame_dict, quad_rows, yolo_rows = _process_frame_cpu(
+        detection_rows, quad_rows, yolo_rows = _process_frame_cpu(
             frame_idx=0,
             frame=sample_gray_image,
             boxes_np=empty_boxes,
@@ -261,8 +286,7 @@ class TestProcessFrameCpu:
             detector=mock_detector,
         )
 
-        assert frame_dict[(COL_FRAME, "")] == 0
-        assert len(frame_dict) == 1
+        assert detection_rows == []
         assert quad_rows == []
         assert yolo_rows == []
         mock_detector.detect.assert_not_called()
@@ -277,7 +301,7 @@ class TestProcessFrameCpu:
 
         mock_detector.raw_quads.return_value = []
 
-        frame_dict, quad_rows, yolo_rows = _process_frame_cpu(
+        detection_rows, quad_rows, yolo_rows = _process_frame_cpu(
             frame_idx=42,
             frame=sample_gray_image,
             boxes_np=boxes,
@@ -289,7 +313,7 @@ class TestProcessFrameCpu:
             confs_np=np.array([0.91], dtype=np.float32),
         )
 
-        assert frame_dict[(COL_FRAME, "")] == 42
+        assert detection_rows == []
         assert quad_rows == []
         # All-YOLO sidecar should always have one row per YOLO box; the
         # single box decoded nothing, so it carries decoded=False and

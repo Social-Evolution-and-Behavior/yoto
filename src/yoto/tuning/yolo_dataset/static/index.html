@@ -1,0 +1,40 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>YOTO — YOLO Dataset Builder</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <div id="sidebar">
+    <h2>Frames</h2>
+    <ul id="frame-list"></ul>
+    <h2>Thresholds</h2>
+    <div id="sliders"></div>
+    <h2>Export</h2>
+    <label><input type="checkbox" class="fmt" value="labelme" checked /> LabelMe</label>
+    <label><input type="checkbox" class="fmt" value="yolo_obb" /> YOLO OBB</label>
+    <label><input type="checkbox" class="fmt" value="yolo_axis" /> YOLO axis</label>
+    <label title="Fraction of accepted frames held out as the YOLO validation set (the rest become the training set)">
+      validation split
+      <input id="val-frac" type="number" value="0.2" step="0.05" min="0" max="1" />
+    </label>
+    <button id="export-btn">Export</button>
+    <div id="export-msg"></div>
+  </div>
+  <div id="main">
+    <div id="toolbar">
+      <button id="accept-btn">Accept (a)</button>
+      <button id="skip-btn">Skip (s)</button>
+      <button id="accept-all-btn">Accept ALL</button>
+      <span id="frame-title"></span>
+      <span id="legend">
+        <span style="color:#22e06b">■ keep</span>
+        <span style="color:#2f9bff">■ drop</span>
+      </span>
+    </div>
+    <canvas id="canvas"></canvas>
+  </div>
+  <script src="/static/app.js"></script>
+</body>
+</html>

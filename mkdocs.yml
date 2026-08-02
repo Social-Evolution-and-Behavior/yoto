@@ -6,6 +6,8 @@ repo_name: Social-Evolution-and-Behavior/yoto
 
 theme:
   name: material
+  logo: assets/YOTO-LOGO-W.png
+  favicon: assets/YOTO-LOGO.png
   palette:
     - scheme: default
       primary: deep orange

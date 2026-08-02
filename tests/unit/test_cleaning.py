@@ -9,7 +9,6 @@ import pandas as pd
 import pytest
 
 from yoto.cleaning import (
-    _compute_snap_threshold,
     _fill_via_yolo,
     _interpolate_data,
     clean_tracking_data,
@@ -115,6 +114,7 @@ class TestCleanTrackingData:
         expected_keys = {
             "total_samples",
             "total_detections",
+            "final_count",
             "original_good_count",
             "original_bad_count",
             "original_missing_count",
@@ -131,7 +131,8 @@ class TestCleanTrackingData:
             "yolo_rechained_count",
             "long_gap_recovered_count",
             "final_jump_deleted_count",
-            "snap_threshold_px",
+            "tag_size_px",
+            "max_move_px",
         }
         assert set(metrics.keys()) == expected_keys
 
@@ -201,36 +202,6 @@ def _attach_ass_type(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-class TestComputeSnapThreshold:
-    """Tests for _compute_snap_threshold."""
-
-    def test_returns_inf_when_no_originals(self) -> None:
-        df = _make_tracking_df({1: ([np.nan] * 5, [np.nan] * 5)})
-        df = _attach_ass_type(df)
-        thr = _compute_snap_threshold(df, np.array([1]))
-        assert np.isinf(thr)
-
-    def test_uses_consecutive_originals_only(self) -> None:
-        # Tag 1: positions every frame, distance per step = 10 px
-        xs = [0.0, 10.0, 20.0, 30.0, 40.0]
-        ys = [0.0, 0.0, 0.0, 0.0, 0.0]
-        df = _make_tracking_df({1: (xs, ys)})
-        df = _attach_ass_type(df)
-        thr = _compute_snap_threshold(df, np.array([1]), percentile=50.0)
-        assert thr == pytest.approx(10.0)
-
-    def test_ignores_gaps(self) -> None:
-        # Tag 1: jump from frame 2 to frame 4 over a gap → must NOT be
-        # counted as a per-frame distance.
-        xs = [0.0, 10.0, 20.0, np.nan, 100.0]
-        ys = [0.0, 0.0, 0.0, np.nan, 0.0]
-        df = _make_tracking_df({1: (xs, ys)})
-        df = _attach_ass_type(df)
-        thr = _compute_snap_threshold(df, np.array([1]), percentile=99.0)
-        # Only the consecutive-original distances (10, 10) should count.
-        assert thr == pytest.approx(10.0)
-
-
 class TestFillViaYolo:
     """Tests for _fill_via_yolo (forward + backward chain, constant snap)."""
 
@@ -252,8 +223,8 @@ class TestFillViaYolo:
             df,
             np.array([1]),
             undecoded,
-            snap_threshold=15.0,
-            snap_multiplier=1.0,
+            tag_size_px=15.0,
+            tag_size_multiplier=1.0,
         )
         assert filled == 2
         assert df.loc[1, (1, COL_ASS_TYPE)] == ASS_TYPE_YOLO_INFERRED
@@ -269,8 +240,8 @@ class TestFillViaYolo:
             df,
             np.array([1]),
             undecoded,
-            snap_threshold=10.0,
-            snap_multiplier=2.0,
+            tag_size_px=10.0,
+            tag_size_multiplier=2.0,
         )
         assert filled == 0
         assert pd.isna(df.loc[1, (1, COL_CENTER_X)])
@@ -287,8 +258,8 @@ class TestFillViaYolo:
             df,
             np.array([1]),
             undecoded,
-            snap_threshold=5.0,
-            snap_multiplier=1.0,
+            tag_size_px=5.0,
+            tag_size_multiplier=1.0,
         )
         assert filled == 3
         for f in (0, 1, 2):
@@ -316,8 +287,8 @@ class TestFillViaYolo:
             df,
             np.array([1]),
             undecoded,
-            snap_threshold=10.0,
-            snap_multiplier=1.0,
+            tag_size_px=10.0,
+            tag_size_multiplier=1.0,
             max_consecutive_misses=3,
         )
         assert filled == 3
@@ -334,8 +305,8 @@ class TestFillViaYolo:
             df,
             np.array([1]),
             undecoded,
-            snap_threshold=15.0,
-            snap_multiplier=1.0,
+            tag_size_px=15.0,
+            tag_size_multiplier=1.0,
             yolo_fill_limit=0,
         )
         assert filled == 9
@@ -362,8 +333,8 @@ class TestFillViaYolo:
             df,
             np.array([1, 2]),
             undecoded,
-            snap_threshold=10.0,
-            snap_multiplier=2.0,
+            tag_size_px=10.0,
+            tag_size_multiplier=2.0,
         )
         assert filled == 2
         assert df.loc[1, (1, COL_CENTER_X)] == pytest.approx(1.0)
@@ -435,7 +406,7 @@ class TestCleanTrackingDataWithYoloFill:
             min_detections=1,
             interpolation_limit=2,
             undecoded_df=undecoded,
-            snap_multiplier=5.0,
+            tag_size_multiplier=5.0,
         )
         # Counters exist and are non-negative.
         assert metrics["yolo_pruned_count"] >= 0

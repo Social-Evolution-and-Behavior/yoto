@@ -29,6 +29,8 @@ dependencies = [
     "Pillow>=10.0",
     "tqdm>=4.60",
     "ultralytics>=8.0",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
 ]
 
 [project.optional-dependencies]
@@ -54,6 +56,10 @@ lint = [
     "flake8>=6.0",
     "mypy>=1.5",
     "vulture>=2.7",
+]
+tune = [
+    "optuna>=3.0",
+    "plotly>=5.0",
 ]
 
 [project.scripts]

@@ -11,3 +11,26 @@
 .language-bash .mo {
   color: inherit;
 }
+
+/* Enlarge the persistent header logo — Material caps it at 1.2rem,
+   which reads as tiny in the deep-orange banner.  The logo is pulled
+   out of the header's flex flow (position: absolute) so growing it
+   never inflates the banner height or pushes down onto the tab row
+   (Home / Installation / ...).  It is vertically centred on the
+   header and anchored to the far left. */
+.md-header__button.md-logo {
+  position: relative;
+  width: 2.6rem;   /* reserve horizontal room; height stays the header's */
+  height: 2.4rem;
+  padding: 0;
+  overflow: visible;
+}
+.md-header__button.md-logo img,
+.md-header__button.md-logo svg {
+  position: absolute;
+  top: 90%;
+  left: -200%;
+  transform: translateY(-50%);
+  height: 4rem;  /* bump this to taste; it no longer resizes the banner */
+  width: auto;
+}

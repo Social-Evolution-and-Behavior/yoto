@@ -13,13 +13,16 @@ except PackageNotFoundError:
     __version__ = "0.0.0+unknown"
 
 from yoto.detection import run_detection_simple, run_detection_fast
-from yoto.cleaning import clean_tracking_data
+from yoto.cleaning import clean_tracking_data, clean_video
 from yoto.video import render_overlay_video
+from yoto.io import load_data
 
 __all__ = [
     "__version__",
     "run_detection_simple",
     "run_detection_fast",
     "clean_tracking_data",
+    "clean_video",
     "render_overlay_video",
+    "load_data",
 ]

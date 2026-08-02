@@ -1,3 +1,8 @@
+<p align="center">
+  <img src="assets/YOTO-LOGO.png#only-light" alt="YOTO logo" width="260">
+  <img src="assets/YOTO-LOGO-W.png#only-dark" alt="YOTO logo" width="260">
+</p>
+
 # YOTO
 
 **GPU-accelerated AprilTag tracking pipeline for ant behavioral studies.**

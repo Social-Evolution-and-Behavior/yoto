@@ -193,7 +193,7 @@ class TestTrackingLayout:
         layout = _tracking_layout(str(tmp_path))  # type: ignore[arg-type]
         assert set(layout.keys()) == set(TRACKING_SUBDIRS.keys())
         for name, path in layout.items():
-            assert path.endswith(os.path.join(TRACKING_DIR, name))
+            assert path.endswith(os.path.join(TRACKING_DIR, TRACKING_SUBDIRS[name]))
 
     def test_paths_not_created(self, tmp_path: object) -> None:
         layout = _tracking_layout(str(tmp_path))  # type: ignore[arg-type]

@@ -8,10 +8,14 @@ quality metrics.
 
 from __future__ import annotations
 
+import logging
+import os
 from typing import Any
 
 import numpy as np
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 from yoto.exceptions import EmptyTrackingError
 from yoto.constants import (
@@ -25,15 +29,14 @@ from yoto.constants import (
     COL_CORNERS,
     COL_DISTANCE,
     DEFAULT_FINAL_JUMP_PASS,
-    DEFAULT_GOOD_TRACK_PERCENTILE,
     DEFAULT_INTERPOLATION_LIMIT,
     DEFAULT_MAX_CONSECUTIVE_MISSES,
     DEFAULT_MAX_JUMP_DISTANCE,
     DEFAULT_MIN_GAP_RECOVERY_FRAMES,
+    DEFAULT_TAG_SIZE_MULTIPLIER,
     DEFAULT_RECHAIN_AFFECTED_ONLY,
     DEFAULT_RECOVER_LONG_GAPS,
     DEFAULT_SCALE_SAMPLE_SIZE,
-    DEFAULT_SNAP_MULTIPLIER,
     DEFAULT_TAG_SIZE_MM,
     DEFAULT_YOLO_FILL_LIMIT,
     MIN_DETECTIONS_PER_ID,
@@ -50,6 +53,132 @@ CleaningMetrics = dict[str, int | float]
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+
+def _resolve_duplicate_ids(df: pd.DataFrame, frame_col: str) -> pd.DataFrame:
+    """Pick one row per ``(frame, tag_id)`` when a tag was decoded twice.
+
+    A physical ant carries a single tag, so two decodes of the same ID in
+    one frame mean at most one is genuine (the other is an AprilTag
+    misdecode elsewhere in the frame).  Rather than blindly keeping the
+    first occurrence, choose the candidate whose center best continues the
+    tag's own trajectory: the position interpolated (per axis, via
+    :func:`numpy.interp`) from the frames where that tag *was* decoded
+    unambiguously — exactly once.  Tags that are ambiguous in every frame
+    they appear (no singleton anchor) fall back to the first occurrence.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Long-format detections with a plain ``tag_id`` column and *frame_col*
+        as a column (i.e. after ``reset_index``).  Its index must be unique.
+    frame_col : str
+        Name of the frame-number column.
+
+    Returns
+    -------
+    pd.DataFrame
+        *df* with all but one row dropped from each duplicated group.
+    """
+    sizes = df.groupby([frame_col, "tag_id"])[frame_col].transform("size")
+    dup = sizes.to_numpy() > 1
+    if not dup.any():
+        return df
+
+    has_xy = COL_CENTER_X in df.columns and COL_CENTER_Y in df.columns
+
+    # Anchor trajectories: only frames where a tag was decoded exactly once.
+    anchors: dict[Any, pd.DataFrame] = {}
+    if has_xy:
+        anchors = {
+            tid: g.sort_values(frame_col) for tid, g in df.loc[~dup].groupby("tag_id")
+        }
+
+    keep = np.ones(len(df), dtype=bool)
+    n_continuity = n_fallback = 0
+    for (frame, tid), grp in df.loc[dup].groupby([frame_col, "tag_id"]):
+        idxs = grp.index.to_numpy()
+        anc = anchors.get(tid)
+        if anc is not None and len(anc):
+            ex = np.interp(frame, anc[frame_col], anc[COL_CENTER_X])
+            ey = np.interp(frame, anc[frame_col], anc[COL_CENTER_Y])
+            d = (grp[COL_CENTER_X] - ex) ** 2 + (grp[COL_CENTER_Y] - ey) ** 2
+            winner = idxs[int(np.argmin(d.to_numpy()))]
+            n_continuity += 1
+        else:
+            winner = idxs[0]
+            n_fallback += 1
+        keep[df.index.get_indexer(idxs[idxs != winner])] = False
+
+    dup_ids = sorted(int(x) for x in df.loc[dup, "tag_id"].unique())
+    logger.warning(
+        "Duplicate tag IDs in raw detection data (%d rows across %d tags): %s. "
+        "Resolved %d group(s) by trajectory continuity, %d by first occurrence "
+        "(no unambiguous anchor).",
+        int(dup.sum()),
+        len(dup_ids),
+        dup_ids,
+        n_continuity,
+        n_fallback,
+    )
+    return df[keep]
+
+
+def _ensure_wide(frame_data: pd.DataFrame) -> pd.DataFrame:
+    """Convert a long-format detection pkl to wide MultiIndex format if needed.
+
+    The raw pkl produced by ``yoto detect`` is long format (one row per
+    detection, columns ``tag_id / center_x / center_y / corners``).  This
+    function pivots it to the wide ``(tag_id, metric)`` MultiIndex format
+    expected by the rest of cleaning.  Already-wide DataFrames pass through
+    unchanged.
+
+    Duplicate ``(frame, tag_id)`` pairs (same tag ID decoded from two YOLO
+    boxes in the same frame) are resolved by :func:`_resolve_duplicate_ids`
+    (trajectory continuity); all occurrences are preserved in the raw pkl.
+    """
+    if isinstance(frame_data.columns, pd.MultiIndex):
+        return frame_data
+    if "tag_id" not in frame_data.columns:
+        return frame_data
+
+    attrs = dict(frame_data.attrs)
+
+    df = frame_data.reset_index()  # bring COL_FRAME back as a plain column
+    frame_col = df.columns[0]  # "frame"
+
+    df = _resolve_duplicate_ids(df, frame_col)
+
+    # Pivot numeric and object columns separately so the numeric ones keep
+    # float dtype (a single pivot with mixed value types yields object dtype,
+    # which breaks np.sqrt in _compute_distances).
+    numeric_cols = [c for c in [COL_CENTER_X, COL_CENTER_Y] if c in df.columns]
+    object_cols = [c for c in [COL_CORNERS] if c in df.columns]
+
+    parts = []
+    if numeric_cols:
+        num_wide = df.pivot(index=frame_col, columns="tag_id", values=numeric_cols)
+        num_wide = num_wide.astype(float)
+        parts.append(num_wide)
+    if object_cols:
+        obj_wide = df.pivot(index=frame_col, columns="tag_id", values=object_cols)
+        parts.append(obj_wide)
+
+    wide = parts[0].join(parts[1:]) if len(parts) > 1 else parts[0]
+
+    # pivot gives (metric, tag_id); swap to (tag_id, metric)
+    wide.columns = pd.MultiIndex.from_tuples(
+        [(b, a) for a, b in wide.columns], names=[None, None]
+    )
+    wide = wide.sort_index(axis=1)
+    wide.index.name = frame_col
+
+    n_frames = attrs.get("yoto_n_frames")
+    if n_frames is not None:
+        wide = wide.reindex(range(int(n_frames)))
+
+    wide.attrs = attrs
+    return wide
 
 
 def _interpolate_data(
@@ -160,29 +289,15 @@ def _delete_jump_blocks(
     return frame_data, del_idx
 
 
-def _compute_snap_threshold(
+def _compute_max_move_px(
     frame_data: pd.DataFrame,
     id_list: np.ndarray[Any, np.dtype[Any]],
-    percentile: float = DEFAULT_GOOD_TRACK_PERCENTILE,
+    percentile: float = 99.0,
 ) -> float:
-    """Per-frame movement threshold derived from "good" track segments.
+    """99th-percentile frame-to-frame movement across all ORIGINAL detections.
 
-    For each tag, collect frame-to-frame Euclidean distances between
-    pairs of *consecutive* frames where both endpoints have
-    ``ass_type == ORIGINAL``.  Consecutive in *frame index* — not just
-    in the row count — so gaps don't bias the distribution.  Return
-    the *percentile*-th value across all collected distances.
-
-    Used by :func:`_fill_via_yolo` as the maximum distance an undecoded
-    YOLO box can be from a tag's last-known position to be accepted as
-    that tag's position on a gap frame.
-
-    Returns
-    -------
-    float
-        The threshold in pixels.  ``inf`` when no good consecutive
-        pairs exist (e.g., on a synthetic single-frame DataFrame),
-        which effectively disables snapping.
+    Informational metric only — not used as a threshold.  Returns ``inf``
+    when no consecutive ORIGINAL pairs exist.
     """
     distances: list[float] = []
     for tag_id in id_list:
@@ -213,7 +328,7 @@ def _chain_pass(
     t_arr: np.ndarray[Any, np.dtype[np.int64]],
     frames: np.ndarray[Any, np.dtype[Any]],
     by_frame: dict[Any, tuple[np.ndarray, np.ndarray]],
-    snap_max: float,
+    dist_max: float,
     max_consecutive_misses: int,
     yolo_fill_limit: int,
     forward: bool,
@@ -231,9 +346,9 @@ def _chain_pass(
     with an active anchor:
 
     * If the closest undecoded YOLO box on this frame is within
-      ``snap_max`` of the anchor → snap; reset misses and age.
+      ``dist_max`` of the anchor → match; reset misses and age.
     * Else → increment misses; clear anchor after
-      ``max_consecutive_misses`` consecutive non-snaps.
+      ``max_consecutive_misses`` consecutive missed frames.
 
     The optional ``yolo_fill_limit`` (> 0) clears the anchor when it's
     been more than that many frames since the last refresh, regardless
@@ -244,11 +359,11 @@ def _chain_pass(
     box_id, tag_idx, pass, distance}``.
 
     ``per_tag_forbidden`` maps tag_idx → set of box_ids that tag may not
-    snap to.  ``candidate_tag_indices`` restricts which tags are active
+    claim.  ``candidate_tag_indices`` restricts which tags are active
     candidates (others still refresh anchors from existing data but don't
-    snap to new boxes).  ``claimed_per_frame`` maps frame_label → set of
+    claim new boxes).  ``claimed_per_frame`` maps frame_label → set of
     box_ids that are already in use at that frame and must not be
-    snapped to by *any* tag; the dict is mutated in place so a forward
+    claimed by *any* tag; the dict is mutated in place so a forward
     pass populates it and a subsequent backward pass inherits its
     claims.  Pre-populating it before the forward call also blocks
     boxes that existing YOLO_INFERRED cells already use.
@@ -327,12 +442,12 @@ def _chain_pass(
             continue
 
         # Build the (candidates × boxes) distance matrix and greedily
-        # assign closest pairs within snap_max.  Greedy per-frame
+        # assign closest pairs within dist_max.  Greedy per-frame
         # matching avoids first-tag-grabs-the-box bias.
         tag_pos = np.column_stack([anchor_x[candidate_idx], anchor_y[candidate_idx]])
         diff = tag_pos[:, None, :] - boxes[None, :, :]
         dists = np.sqrt((diff * diff).sum(axis=-1))
-        dists_masked = np.where(dists > snap_max, np.inf, dists)
+        dists_masked = np.where(dists > dist_max, np.inf, dists)
         if per_tag_forbidden:
             for row_j, tag_j in enumerate(candidate_idx):
                 forbidden_j = per_tag_forbidden.get(int(tag_j))
@@ -413,26 +528,26 @@ def _fill_via_yolo(
     frame_data: pd.DataFrame,
     id_list: np.ndarray[Any, np.dtype[Any]],
     undecoded_df: pd.DataFrame,
-    snap_threshold: float,
-    snap_multiplier: float = DEFAULT_SNAP_MULTIPLIER,
+    tag_size_px: float,
+    tag_size_multiplier: float = DEFAULT_TAG_SIZE_MULTIPLIER,
     yolo_fill_limit: int = DEFAULT_YOLO_FILL_LIMIT,
     max_consecutive_misses: int = DEFAULT_MAX_CONSECUTIVE_MISSES,
 ) -> tuple[int, list[dict[str, Any]]]:
     """Bridge per-tag gaps using undecoded YOLO box centers.
 
-    Forward-then-backward chain matching with a constant snap distance.
+    Forward-then-backward chain matching with a fixed maximum distance.
+    The search radius is ``tag_size_px * tag_size_multiplier`` — constant,
+    not age-scaled, so long stretches stay tight against nearby ants.
 
-    For each frame in order, every tag with an active anchor (last
-    known position from ORIGINAL or earlier YOLO_INFERRED fill) is
-    paired greedily with the closest undecoded YOLO box on that frame.
-    A pair only counts as a match when the distance is within
-    ``snap_threshold * snap_multiplier`` — constant, not age-scaled, so
-    long stretches stay tight against nearby ants.
+    For each frame in order, every tag with an active anchor (last known
+    position from ORIGINAL or earlier YOLO_INFERRED fill) is paired
+    greedily with the closest undecoded YOLO box on that frame within
+    the search radius.
 
     A tag's chain breaks (anchor cleared) after
-    ``max_consecutive_misses`` consecutive frames where no box passes
-    the snap test.  ``yolo_fill_limit > 0`` also clears the anchor
-    after that many frames without a refresh; ``0`` disables that cap.
+    ``max_consecutive_misses`` consecutive frames with no matching box.
+    ``yolo_fill_limit > 0`` also clears the anchor after that many
+    frames without a refresh; ``0`` disables that cap.
 
     After the forward pass, a backward pass repeats the same matching
     in reverse, anchoring on ORIGINAL detections and on forward fills.
@@ -441,7 +556,7 @@ def _fill_via_yolo(
     forward chain abandoned too early.
 
     Mutates *frame_data* in place.  Returns ``(filled, claims)`` where
-    *claims* is the merged list of per-snap records from both passes
+    *claims* is the merged list of per-match records from both passes
     (see :func:`_chain_pass` for the record schema).  ``box_id`` in the
     records is the integer row position in *undecoded_df*; the loader
     builds an explicit array so the same id is stable across calls.
@@ -483,7 +598,7 @@ def _fill_via_yolo(
         by_frame[fval] = (pos_arr[ids], ids)
 
     frames = frame_data.index.to_numpy()
-    snap_max = snap_threshold * snap_multiplier
+    dist_max = tag_size_px * tag_size_multiplier
 
     # Deliberately do NOT share a claimed_per_frame between forward and
     # backward here: cross-pass collisions are the *signal*
@@ -498,7 +613,7 @@ def _fill_via_yolo(
         t_arr,
         frames,
         by_frame,
-        snap_max=snap_max,
+        dist_max=dist_max,
         max_consecutive_misses=max_consecutive_misses,
         yolo_fill_limit=yolo_fill_limit,
         forward=True,
@@ -510,7 +625,7 @@ def _fill_via_yolo(
         t_arr,
         frames,
         by_frame,
-        snap_max=snap_max,
+        dist_max=dist_max,
         max_consecutive_misses=max_consecutive_misses,
         yolo_fill_limit=yolo_fill_limit,
         forward=False,
@@ -605,7 +720,7 @@ def _run_chain_pair(
     t_arr: np.ndarray[Any, np.dtype[np.int64]],
     frames: np.ndarray[Any, np.dtype[Any]],
     by_frame: dict[Any, tuple[np.ndarray, np.ndarray]],
-    snap_max: float,
+    dist_max: float,
     max_consecutive_misses: int,
     yolo_fill_limit: int,
     per_tag_forbidden: dict[int, set[int]] | None = None,
@@ -629,7 +744,7 @@ def _run_chain_pair(
         t_arr,
         frames,
         by_frame,
-        snap_max=snap_max,
+        dist_max=dist_max,
         max_consecutive_misses=max_consecutive_misses,
         yolo_fill_limit=yolo_fill_limit,
         forward=True,
@@ -644,7 +759,7 @@ def _run_chain_pair(
         t_arr,
         frames,
         by_frame,
-        snap_max=snap_max,
+        dist_max=dist_max,
         max_consecutive_misses=max_consecutive_misses,
         yolo_fill_limit=yolo_fill_limit,
         forward=False,
@@ -666,7 +781,7 @@ def _prune_ambiguous_tracklets(
     An *ambiguity* is a ``(frame, box_id)`` claimed by two or more different
     tags in the merged forward+backward claims list — almost always a
     cross-pass collision where the forward chain of one tag and the backward
-    chain of another both snapped to the same undecoded YOLO box, producing
+    chain of another both matched to the same undecoded YOLO box, producing
     identical centroids on that frame.  For each tag involved, every
     non-ORIGINAL cell between the surrounding ORIGINALs is cleared and the
     ambiguous ``box_id`` is added to that tag's forbidden set so the
@@ -674,7 +789,7 @@ def _prune_ambiguous_tracklets(
 
     Bounding by ORIGINALs (instead of a threshold around the ambiguity
     frame) lets the re-chain rebuild the whole tracklet from scratch with
-    the bad box excluded — the *good* half of the tracklet re-snaps to its
+    the bad box excluded — the *good* half of the tracklet re-matches its
     correct boxes, the *bad* half is forbidden the only entry point onto
     the wrong path.
 
@@ -779,8 +894,8 @@ def _recover_long_gaps(
     frame_data: pd.DataFrame,
     id_list: np.ndarray[Any, np.dtype[Any]],
     undecoded_df: pd.DataFrame,
-    snap_threshold: float,
-    snap_multiplier: float,
+    tag_size_px: float,
+    tag_size_multiplier: float,
     min_gap_frames: int,
 ) -> int:
     """Experimental: fill long NaN gaps from YOLO boxes near the anchors.
@@ -791,7 +906,7 @@ def _recover_long_gaps(
 
     * **Forward** from the leading anchor (last known position before
       the gap).  At each gap frame, look at every undecoded YOLO box
-      within ``snap_threshold * snap_multiplier`` of the *current*
+      within ``tag_size_px * tag_size_multiplier`` of the *current*
       forward anchor — the cutoff — and among those, pick the one
       closest to the *predicted* position ``anchor + velocity``.  The
       anchor advances to that box, the per-frame velocity updates.
@@ -801,7 +916,7 @@ def _recover_long_gaps(
 
     Chained anchors let the recovery follow a moving ant across the
     gap; the velocity-prediction tiebreak picks the *trajectory-
-    consistent* box when multiple candidates are within snap_max — for
+    consistent* box when multiple candidates are within dist_max — for
     instance when a spurious YOLO detection appears near the real ant
     on a single frame.
 
@@ -817,7 +932,7 @@ def _recover_long_gaps(
     if COL_CENTER_X not in undecoded_df.columns:
         return 0
 
-    snap_max = snap_threshold * snap_multiplier
+    dist_max = tag_size_px * tag_size_multiplier
     by_frame = _build_box_lookup(undecoded_df)
     frames_arr = frame_data.index.to_numpy()
     n_frames = len(frames_arr)
@@ -873,11 +988,11 @@ def _recover_long_gaps(
                 pred_x: float,
                 pred_y: float,
             ) -> tuple[float, float] | None:
-                """Try to snap tag at position k.  Cutoff: distance from
-                anchor must be ≤ snap_max.  Selection: among candidates
-                that pass the cutoff and aren't claimed, pick the one
-                closest to (pred_x, pred_y).  Returns the new
-                (anchor_x, anchor_y) on success, None on miss."""
+                """Match tag at position k to the closest YOLO box.
+                Cutoff: distance from anchor must be ≤ dist_max.
+                Selection: among candidates that pass the cutoff and
+                aren't claimed, pick the one closest to (pred_x, pred_y).
+                Returns the new (anchor_x, anchor_y) on success, None on miss."""
                 f = int(frames_arr[k])
                 entry = by_frame.get(f)
                 if entry is None:
@@ -888,7 +1003,7 @@ def _recover_long_gaps(
                 d_anchor = np.sqrt(
                     (boxes[:, 0] - anchor_x) ** 2 + (boxes[:, 1] - anchor_y) ** 2
                 )
-                valid = d_anchor <= snap_max
+                valid = d_anchor <= dist_max
                 claimed_ids = claimed.get(f, set())
                 for b in range(len(boxes)):
                     if int(box_ids[b]) in claimed_ids:
@@ -1046,6 +1161,7 @@ def compute_pixel_scale(
         ``(median_side_px, mm_per_px, n_samples)``.  Returns
         ``(nan, nan, 0)`` if no usable corners are present.
     """
+    frame_data = _ensure_wide(frame_data)
     if COL_CORNERS not in frame_data.columns.get_level_values(1):
         return float("nan"), float("nan"), 0
 
@@ -1098,8 +1214,7 @@ def clean_tracking_data(
     max_jump_distance: float = DEFAULT_MAX_JUMP_DISTANCE,
     undecoded_df: pd.DataFrame | None = None,
     yolo_fill_limit: int = DEFAULT_YOLO_FILL_LIMIT,
-    snap_percentile: float = DEFAULT_GOOD_TRACK_PERCENTILE,
-    snap_multiplier: float = DEFAULT_SNAP_MULTIPLIER,
+    tag_size_multiplier: float = DEFAULT_TAG_SIZE_MULTIPLIER,
     max_consecutive_misses: int = DEFAULT_MAX_CONSECUTIVE_MISSES,
     rechain_affected_only: bool = DEFAULT_RECHAIN_AFFECTED_ONLY,
     recover_long_gaps: bool = DEFAULT_RECOVER_LONG_GAPS,
@@ -1119,9 +1234,11 @@ def clean_tracking_data(
     5. Delete unrealistic jumps (distance > *max_jump_distance*).
     6. *(Optional, when undecoded_df provided)*:
        a. YOLO-fill — forward+backward chain matching to undecoded boxes.
+          Search radius: ``tag_size_px * tag_size_multiplier`` where
+          ``tag_size_px`` is the median tag side length in pixels.
        c. Detect *ambiguity* events (same ``(frame, box_id)`` claimed by
           two or more different tags — typically forward+backward
-          cross-pass collisions where both chains snapped to the same
+          cross-pass collisions where both chains matched the same
           shared YOLO box).  For each tag involved, clear every
           non-ORIGINAL cell between the surrounding ORIGINALs and add
           the ambiguous box to that tag's forbidden set.
@@ -1132,8 +1249,8 @@ def clean_tracking_data(
        f. Final jump deletion (safety net for residual mistakes).
     7. *(Optional, experimental — gated by* ``recover_long_gaps`` *)*:
        For each tag with a NaN gap longer than *min_gap_recovery_frames*,
-       snap each gap frame to the closest unclaimed undecoded YOLO box
-       within ``snap_threshold * snap_multiplier`` of the gap's leading
+       match each gap frame to the closest unclaimed undecoded YOLO box
+       within ``tag_size_px * tag_size_multiplier`` of the gap's leading
        OR trailing anchor (fixed anchors — no drift).  Targets ants
        whose AprilTag was temporarily un-decodable but YOLO still saw
        the ant.  Operates on raw NaN gaps before interpolation.
@@ -1159,10 +1276,10 @@ def clean_tracking_data(
         and ``center_y``; index is frame number.
     yolo_fill_limit : int
         Hard cap on chain length without anchor refresh.  ``0`` disables.
-    snap_percentile : float
-        Percentile of original-to-original distances for snap threshold.
-    snap_multiplier : float
-        Multiplier on snap threshold to get the maximum snap distance.
+    tag_size_multiplier : float
+        Multiplier applied to the median tag side length (px) to obtain the
+        maximum distance a YOLO box can be from a tag's anchor to be accepted.
+        Constant — does not scale with gap age.
     max_consecutive_misses : int
         Chain breaks after this many consecutive missed frames.
     rechain_affected_only : bool
@@ -1188,6 +1305,7 @@ def clean_tracking_data(
     >>> cleaned, ids, metrics = clean_tracking_data(df)  # doctest: +SKIP
     >>> print(f"Error rate: {metrics['error_pct']:.2f}%")  # doctest: +SKIP
     """
+    frame_data = _ensure_wide(frame_data)
     input_attrs = dict(frame_data.attrs)
 
     if frame_data.empty or frame_data.shape[1] == 0:
@@ -1241,6 +1359,8 @@ def clean_tracking_data(
             (tag_id, COL_ASS_TYPE),
         ] = ASS_TYPE_ORIGINAL
 
+    max_move_px = _compute_max_move_px(frame_data, id_list)
+
     # --- Step 3: interpolate short gaps ---
     frame_data = _interpolate_data(frame_data, limit=interpolation_limit)
     for tag_id in id_list:
@@ -1264,131 +1384,126 @@ def clean_tracking_data(
     after_5 = frame_data.xs(COL_CENTER_X, axis=1, level=1)[id_list].notna().values
     jump_deleted_count += int((before_5 & ~after_5).sum())
 
-    snap_threshold: float = float("inf")
+    tag_size_px: float = float("inf")
     yolo_filled_count = 0
     yolo_pruned_count = 0
     yolo_rechained_count = 0
 
     if undecoded_df is not None:
-        snap_threshold = _compute_snap_threshold(frame_data, id_list, snap_percentile)
-        if np.isfinite(snap_threshold):
-            snap_max = snap_threshold * snap_multiplier
-            by_frame = _build_box_lookup(undecoded_df)
+        tag_size_px = (
+            median_tag_side_px if np.isfinite(median_tag_side_px) else float("inf")
+        )
+        dist_max = tag_size_px * tag_size_multiplier
+        by_frame = _build_box_lookup(undecoded_df)
 
-            # --- Step 6a: initial YOLO-fill (all tags, no forbidden) ---
-            yolo_filled_count, claims = _fill_via_yolo(
-                frame_data,
-                id_list,
-                undecoded_df,
-                snap_threshold=snap_threshold,
-                snap_multiplier=snap_multiplier,
-                yolo_fill_limit=yolo_fill_limit,
-                max_consecutive_misses=max_consecutive_misses,
+        # --- Step 6a: initial YOLO-fill (all tags, no forbidden) ---
+        yolo_filled_count, claims = _fill_via_yolo(
+            frame_data,
+            id_list,
+            undecoded_df,
+            tag_size_px=tag_size_px,
+            tag_size_multiplier=tag_size_multiplier,
+            yolo_fill_limit=yolo_fill_limit,
+            max_consecutive_misses=max_consecutive_misses,
+        )
+        _maybe_save_snapshot(frame_data, debug_snapshot_dir, "step6a_after_fill")
+
+        # --- Step 6c: prune ambiguous tracklets ---
+        # Detect (frame, box_id) entries claimed by 2+ tags in the
+        # merged forward+backward claims (forward gives box B to tag
+        # A; backward independently gives the same box to tag B —
+        # both end up at the same exact centroid).  For each tag
+        # involved, clear every non-ORIGINAL cell between the
+        # surrounding ORIGINALs and forbid the ambiguous box from
+        # the next chain pass.
+        per_tag_forbidden, ambig_pruned, affected_tag_indices = (
+            _prune_ambiguous_tracklets(frame_data, id_list, claims)
+        )
+        yolo_pruned_count += ambig_pruned
+        _maybe_save_snapshot(frame_data, debug_snapshot_dir, "step6c_after_prune")
+
+        # --- Step 6d: re-chain on current state (no reset) ---
+        # Keeps all existing YOLO_INFERRED; only fills new gaps and
+        # excludes the per-tag forbidden boxes from step 6c.
+        candidate_tag_indices: set[int] | None = (
+            affected_tag_indices if rechain_affected_only else None
+        )
+        x_arr, y_arr, t_arr = _extract_tag_arrays(frame_data, id_list)
+        frames_arr = frame_data.index.to_numpy()
+
+        # Pre-populate claimed_per_frame from existing YOLO_INFERRED
+        # cells so the re-chain can't snap a tag onto a position
+        # another tag already occupies.  A YOLO_INFERRED centroid is
+        # bit-for-bit equal to its source box's centroid in
+        # by_frame, so the position match is exact.
+        claimed_per_frame: dict[int, set[int]] = {}
+        yolo_mask = t_arr == ASS_TYPE_YOLO_INFERRED
+        for i_pos in range(t_arr.shape[0]):
+            if not yolo_mask[i_pos].any():
+                continue
+            f_label = int(frames_arr[i_pos])
+            entry = by_frame.get(f_label)
+            if entry is None:
+                continue
+            boxes_f, box_ids_f = entry
+            for j_tag in np.where(yolo_mask[i_pos])[0]:
+                match = np.where(
+                    (boxes_f[:, 0] == x_arr[i_pos, j_tag])
+                    & (boxes_f[:, 1] == y_arr[i_pos, j_tag])
+                )[0]
+                for m in match:
+                    claimed_per_frame.setdefault(f_label, set()).add(int(box_ids_f[m]))
+
+        yolo_rechained_count, _ = _run_chain_pair(
+            x_arr,
+            y_arr,
+            t_arr,
+            frames_arr,
+            by_frame,
+            dist_max=dist_max,
+            max_consecutive_misses=max_consecutive_misses,
+            yolo_fill_limit=yolo_fill_limit,
+            per_tag_forbidden=per_tag_forbidden if per_tag_forbidden else None,
+            candidate_tag_indices=candidate_tag_indices,
+            claimed_per_frame=claimed_per_frame,
+        )
+        _writeback_tag_arrays(frame_data, id_list, x_arr, y_arr, t_arr)
+        _maybe_save_snapshot(frame_data, debug_snapshot_dir, "step6d_after_rechain")
+
+        # --- Step 6e: recompute distances after re-chain ---
+        existing_dist = [
+            (tid, COL_DISTANCE)
+            for tid in id_list
+            if (tid, COL_DISTANCE) in frame_data.columns
+        ]
+        if existing_dist:
+            frame_data = frame_data.drop(columns=existing_dist)
+        frame_data = _compute_distances(frame_data, id_list)
+
+        # --- Step 6f: final jump deletion ---
+        before_6f = (
+            frame_data.xs(COL_CENTER_X, axis=1, level=1)[id_list].notna().values.copy()
+        )
+        for tag_id in id_list:
+            frame_data, _ = _delete_jump_blocks(
+                frame_data, tag_id, max_distance=max_jump_distance
             )
-            _maybe_save_snapshot(frame_data, debug_snapshot_dir, "step6a_after_fill")
-
-            # --- Step 6c: prune ambiguous tracklets ---
-            # Detect (frame, box_id) entries claimed by 2+ tags in the
-            # merged forward+backward claims (forward gives box B to tag
-            # A; backward independently gives the same box to tag B —
-            # both end up at the same exact centroid).  For each tag
-            # involved, clear every non-ORIGINAL cell between the
-            # surrounding ORIGINALs and forbid the ambiguous box from
-            # the next chain pass.
-            per_tag_forbidden, ambig_pruned, affected_tag_indices = (
-                _prune_ambiguous_tracklets(frame_data, id_list, claims)
-            )
-            yolo_pruned_count += ambig_pruned
-            _maybe_save_snapshot(frame_data, debug_snapshot_dir, "step6c_after_prune")
-
-            # --- Step 6d: re-chain on current state (no reset) ---
-            # Keeps all existing YOLO_INFERRED; only fills new gaps and
-            # excludes the per-tag forbidden boxes from step 6c.
-            candidate_tag_indices: set[int] | None = (
-                affected_tag_indices if rechain_affected_only else None
-            )
-            x_arr, y_arr, t_arr = _extract_tag_arrays(frame_data, id_list)
-            frames_arr = frame_data.index.to_numpy()
-
-            # Pre-populate claimed_per_frame from existing YOLO_INFERRED
-            # cells so the re-chain can't snap a tag onto a position
-            # another tag already occupies.  A YOLO_INFERRED centroid is
-            # bit-for-bit equal to its source box's centroid in
-            # by_frame, so the position match is exact.
-            claimed_per_frame: dict[int, set[int]] = {}
-            yolo_mask = t_arr == ASS_TYPE_YOLO_INFERRED
-            for i_pos in range(t_arr.shape[0]):
-                if not yolo_mask[i_pos].any():
-                    continue
-                f_label = int(frames_arr[i_pos])
-                entry = by_frame.get(f_label)
-                if entry is None:
-                    continue
-                boxes_f, box_ids_f = entry
-                for j_tag in np.where(yolo_mask[i_pos])[0]:
-                    match = np.where(
-                        (boxes_f[:, 0] == x_arr[i_pos, j_tag])
-                        & (boxes_f[:, 1] == y_arr[i_pos, j_tag])
-                    )[0]
-                    for m in match:
-                        claimed_per_frame.setdefault(f_label, set()).add(
-                            int(box_ids_f[m])
-                        )
-
-            yolo_rechained_count, _ = _run_chain_pair(
-                x_arr,
-                y_arr,
-                t_arr,
-                frames_arr,
-                by_frame,
-                snap_max=snap_max,
-                max_consecutive_misses=max_consecutive_misses,
-                yolo_fill_limit=yolo_fill_limit,
-                per_tag_forbidden=per_tag_forbidden if per_tag_forbidden else None,
-                candidate_tag_indices=candidate_tag_indices,
-                claimed_per_frame=claimed_per_frame,
-            )
-            _writeback_tag_arrays(frame_data, id_list, x_arr, y_arr, t_arr)
-            _maybe_save_snapshot(frame_data, debug_snapshot_dir, "step6d_after_rechain")
-
-            # --- Step 6e: recompute distances after re-chain ---
-            existing_dist = [
-                (tid, COL_DISTANCE)
-                for tid in id_list
-                if (tid, COL_DISTANCE) in frame_data.columns
-            ]
-            if existing_dist:
-                frame_data = frame_data.drop(columns=existing_dist)
-            frame_data = _compute_distances(frame_data, id_list)
-
-            # --- Step 6f: final jump deletion ---
-            before_6f = (
-                frame_data.xs(COL_CENTER_X, axis=1, level=1)[id_list]
-                .notna()
-                .values.copy()
-            )
-            for tag_id in id_list:
-                frame_data, _ = _delete_jump_blocks(
-                    frame_data, tag_id, max_distance=max_jump_distance
-                )
-            after_6f = (
-                frame_data.xs(COL_CENTER_X, axis=1, level=1)[id_list].notna().values
-            )
-            jump_deleted_count += int((before_6f & ~after_6f).sum())
-            _maybe_save_snapshot(frame_data, debug_snapshot_dir, "step6f_after_jump")
+        after_6f = frame_data.xs(COL_CENTER_X, axis=1, level=1)[id_list].notna().values
+        jump_deleted_count += int((before_6f & ~after_6f).sum())
+        _maybe_save_snapshot(frame_data, debug_snapshot_dir, "step6f_after_jump")
 
     # --- Step 7 (experimental): long-gap recovery ---
     # Runs on raw NaN gaps (no prior interpolation), so the gap boundaries
     # are the genuine ORIGINAL/YOLO_INFERRED cells produced by step 6 —
     # not linear-interp guesses.
     long_gap_recovered_count = 0
-    if recover_long_gaps and undecoded_df is not None and np.isfinite(snap_threshold):
+    if recover_long_gaps and undecoded_df is not None and np.isfinite(tag_size_px):
         long_gap_recovered_count = _recover_long_gaps(
             frame_data,
             id_list,
             undecoded_df,
-            snap_threshold=snap_threshold,
-            snap_multiplier=snap_multiplier,
+            tag_size_px=tag_size_px,
+            tag_size_multiplier=tag_size_multiplier,
             min_gap_frames=min_gap_recovery_frames,
         )
         _maybe_save_snapshot(frame_data, debug_snapshot_dir, "step7_after_recovery")
@@ -1480,7 +1595,8 @@ def clean_tracking_data(
         "yolo_rechained_count": yolo_rechained_count,
         "long_gap_recovered_count": long_gap_recovered_count,
         "final_jump_deleted_count": final_jump_deleted_count,
-        "snap_threshold_px": snap_threshold,
+        "tag_size_px": tag_size_px,
+        "max_move_px": max_move_px,
     }
 
     from datetime import datetime, timezone
@@ -1496,8 +1612,9 @@ def clean_tracking_data(
     frame_data.attrs["yoto_version"] = __version__
     frame_data.attrs["yoto_stage"] = "clean"
     frame_data.attrs["yoto_cleaned_utc"] = datetime.now(timezone.utc).isoformat()
-    frame_data.attrs["yoto_snap_threshold_px"] = snap_threshold
-    frame_data.attrs["yoto_snap_multiplier"] = snap_multiplier
+    frame_data.attrs["yoto_tag_size_px"] = tag_size_px
+    frame_data.attrs["yoto_tag_size_multiplier"] = tag_size_multiplier
+    frame_data.attrs["yoto_max_move_px"] = max_move_px
     frame_data.attrs["yoto_yolo_fill_limit"] = yolo_fill_limit
     frame_data.attrs["yoto_max_consecutive_misses"] = max_consecutive_misses
     frame_data.attrs["yoto_yolo_filled_count"] = yolo_filled_count
@@ -1515,3 +1632,160 @@ def clean_tracking_data(
     frame_data.attrs["yoto_scale_sample_count"] = scale_sample_count
 
     return frame_data, id_list, metrics
+
+
+def clean_video(
+    pkl_path: str,
+    output_path: str | None = None,
+    data_suffix: str = "_apriltagDetect14",
+    yolo_fill: bool = True,
+    min_detections: int = MIN_DETECTIONS_PER_ID,
+    interp_limit: int = DEFAULT_INTERPOLATION_LIMIT,
+    max_jump: float = DEFAULT_MAX_JUMP_DISTANCE,
+    yolo_fill_limit: int = DEFAULT_YOLO_FILL_LIMIT,
+    tag_size_multiplier: float = DEFAULT_TAG_SIZE_MULTIPLIER,
+    max_consecutive_misses: int = DEFAULT_MAX_CONSECUTIVE_MISSES,
+    rechain_affected_only: bool = DEFAULT_RECHAIN_AFFECTED_ONLY,
+    recover_long_gaps: bool = DEFAULT_RECOVER_LONG_GAPS,
+    min_gap_recovery_frames: int = DEFAULT_MIN_GAP_RECOVERY_FRAMES,
+    final_jump_pass: bool = DEFAULT_FINAL_JUMP_PASS,
+    tag_size_mm: float = DEFAULT_TAG_SIZE_MM,
+) -> pd.DataFrame:
+    """Clean a single raw detection pickle, mirroring ``yoto clean``.
+
+    Accepts the path to a raw ``.pkl`` written by ``run_detection_fast`` /
+    ``run_detection_simple``, or a video file path (the raw pickle is then
+    discovered automatically via ``tracking/raw_data/<stem><data_suffix>.pkl``).
+
+    The ``_yolo.pkl`` sidecar is discovered automatically next to the raw
+    pickle.  The cleaned DataFrame is written to
+    ``<recording>/tracking/clean_data/<stem>_clean.pkl`` by default and
+    returned.
+
+    Parameters
+    ----------
+    pkl_path : str
+        Path to the raw detection pickle, or to the source video file.
+    output_path : str | None
+        Full path for the output clean pickle.  When ``None`` (default)
+        the file is written to ``<recording>/tracking/clean_data/``,
+        matching the behaviour of ``yoto clean``.
+    data_suffix : str
+        Dataname suffix used to locate the raw pickle when *pkl_path* is
+        a video file (e.g. ``"_apriltagDetect14"``).
+    yolo_fill : bool
+        Whether to use the ``_yolo.pkl`` sidecar to fill tracking gaps.
+
+    Returns
+    -------
+    pd.DataFrame
+        Cleaned tracking DataFrame with ``.attrs`` populated.
+
+    Raises
+    ------
+    FileNotFoundError
+        If the raw pickle (or its auto-discovered path) does not exist.
+    EmptyTrackingError
+        If the pickle contains no usable tag tracks.
+    """
+    from yoto.constants import TRACKING_DIR, TRACKING_SUBDIRS
+
+    # Accept a video path — resolve to the raw pickle.
+    if not pkl_path.endswith(".pkl"):
+        stem = os.path.splitext(os.path.basename(pkl_path))[0]
+        recording_dir = os.path.dirname(os.path.abspath(pkl_path))
+        pkl_path = os.path.join(
+            recording_dir,
+            TRACKING_DIR,
+            TRACKING_SUBDIRS["raw_data"],
+            f"{stem}{data_suffix}.pkl",
+        )
+
+    if not os.path.isfile(pkl_path):
+        raise FileNotFoundError(f"Raw pickle not found: {pkl_path}")
+
+    frame_data = pd.read_pickle(pkl_path)
+
+    if frame_data.empty or frame_data.shape[1] == 0:
+        raise EmptyTrackingError(f"No tag detections in {pkl_path}")
+
+    # Auto-discover the _yolo.pkl sidecar.
+    undecoded_df = None
+    if yolo_fill:
+        yolo_path = pkl_path[:-4] + "_yolo.pkl"
+        if os.path.isfile(yolo_path):
+            yolo_df = pd.read_pickle(yolo_path)
+            undecoded_df = yolo_df[~yolo_df["decoded"].astype(bool)].copy()
+            print(
+                f"YOLO-fill source: {os.path.basename(yolo_path)} "
+                f"(filtered to {len(undecoded_df)} undecoded boxes)"
+            )
+
+    # Resolve output path — default: <recording>/tracking/clean_data/.
+    if output_path is None:
+        abs_pkl = os.path.abspath(pkl_path)
+        pkl_parent = os.path.dirname(abs_pkl)
+        pkl_grandparent = os.path.dirname(pkl_parent)
+        if (
+            os.path.basename(pkl_parent) in TRACKING_SUBDIRS.values()
+            and os.path.basename(pkl_grandparent) == TRACKING_DIR
+        ):
+            recording_dir = os.path.dirname(pkl_grandparent)
+        else:
+            recording_dir = pkl_parent
+        clean_dir = os.path.join(
+            recording_dir, TRACKING_DIR, TRACKING_SUBDIRS["clean_data"]
+        )
+        os.makedirs(clean_dir, exist_ok=True)
+        stem = os.path.splitext(os.path.basename(pkl_path))[0]
+        output_path = os.path.join(clean_dir, f"{stem}_clean.pkl")
+
+    cleaned, _id_list, metrics = clean_tracking_data(
+        frame_data,
+        min_detections=min_detections,
+        interpolation_limit=interp_limit,
+        max_jump_distance=max_jump,
+        undecoded_df=undecoded_df,
+        yolo_fill_limit=yolo_fill_limit,
+        tag_size_multiplier=tag_size_multiplier,
+        max_consecutive_misses=max_consecutive_misses,
+        rechain_affected_only=rechain_affected_only,
+        recover_long_gaps=recover_long_gaps,
+        min_gap_recovery_frames=min_gap_recovery_frames,
+        final_jump_pass=final_jump_pass,
+        tag_size_mm=tag_size_mm,
+    )
+
+    cleaned.to_pickle(output_path)
+    print(f"Cleaned: {output_path}")
+
+    _mm_per_px = cleaned.attrs.get("yoto_mm_per_px", float("nan"))
+    _side_px = cleaned.attrs.get("yoto_median_tag_side_px", float("nan"))
+    _n_scale = cleaned.attrs.get("yoto_scale_sample_count", 0)
+    if _n_scale:
+        print(
+            f"  scale: {_mm_per_px:.5f} mm/px "
+            f"(median tag side {_side_px:.2f} px, n={_n_scale})"
+        )
+    _n = metrics["total_samples"]
+    _raw = metrics["total_detections"]
+    _final = metrics["final_count"]
+    _raw_pct = 100.0 * _raw / _n if _n else 0.0
+    _final_pct = 100.0 * _final / _n if _n else 0.0
+    print(
+        f"  raw: {_raw}/{_n} ({_raw_pct:.1f}%)"
+        f"  →  final: {_final}/{_n} ({_final_pct:.1f}%)"
+    )
+    print(
+        f"    errors={metrics['original_bad_count']} ({metrics['error_pct']:.2f}%)"
+        f" | interp={metrics['filled_count']}"
+        f" | yolo={metrics['yolo_inferred_count']}/{metrics['total_gaps']} gaps"
+        f" ({metrics['yolo_inferred_pct_of_gaps']:.1f}%)"
+        f" | pruned={metrics['yolo_pruned_count']}"
+        f" | rechained={metrics['yolo_rechained_count']}"
+        f" | recovered={metrics['long_gap_recovered_count']}"
+        f" | jump_del={metrics['final_jump_deleted_count']}"
+        f" | max_move={metrics['max_move_px']:.1f}px"
+    )
+
+    return cleaned

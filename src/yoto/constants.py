@@ -6,6 +6,8 @@ be referenced, overridden, and documented in a single place.
 
 from __future__ import annotations
 
+import os
+
 # ---------------------------------------------------------------------------
 # YOLO detection defaults
 # ---------------------------------------------------------------------------
@@ -135,19 +137,14 @@ DEFAULT_INTERPOLATION_LIMIT: int = 5
 #: the evidence runs out.  Set to a positive integer to add a hard cap.
 DEFAULT_YOLO_FILL_LIMIT: int = 0
 
-#: Percentile of the "good track" frame-to-frame distance distribution
-#: used as the per-frame snap threshold for YOLO fill.  A high value
-#: tolerates the rare fast movements without admitting unrealistic jumps.
-DEFAULT_GOOD_TRACK_PERCENTILE: float = 99.0
-
-#: Multiplier applied to ``snap_threshold`` to obtain the maximum
-#: distance between a YOLO box and the linear-interp prior for the
-#: YOLO-fill snap to be accepted.  Constant — does NOT scale with gap
-#: age, so long gaps stay tightly bounded.
-DEFAULT_SNAP_MULTIPLIER: float = 2.0
+#: Multiplier applied to the median tag side length (pixels) to obtain
+#: the maximum distance between a YOLO box and a tag's anchor position
+#: for the YOLO-fill match to be accepted.  Constant — does NOT scale
+#: with gap age, so long gaps stay tightly bounded.
+DEFAULT_TAG_SIZE_MULTIPLIER: float = 2.0
 
 #: Maximum number of consecutive frames inside a chain where no YOLO
-#: box passes the snap test before the chain is broken (anchor cleared).
+#: box is within the search radius before the chain is broken (anchor cleared).
 #: Lets short stretches of bad YOLO detection survive without letting
 #: the chain drift off when the tag really has left the scene.
 DEFAULT_MAX_CONSECUTIVE_MISSES: int = 10
@@ -163,8 +160,8 @@ DEFAULT_MAX_JUMP_DISTANCE: float = 100.0
 
 #: Experimental: run a "long-gap recovery" sweep after final interpolation.
 #: For each tag with a NaN gap longer than
-#: ``DEFAULT_MIN_GAP_RECOVERY_FRAMES``, snap each gap frame to the closest
-#: unclaimed YOLO box within ``snap_threshold * snap_multiplier`` of the
+#: ``DEFAULT_MIN_GAP_RECOVERY_FRAMES``, match each gap frame to the closest
+#: unclaimed YOLO box within ``median_tag_side_px * tag_size_multiplier`` of the
 #: gap's leading OR trailing anchor (anchors are *fixed* — they don't
 #: drift).  Targets the "temporarily dirty AprilTag on a stopped ant"
 #: failure mode.  Off by default.
@@ -177,6 +174,11 @@ DEFAULT_MIN_GAP_RECOVERY_FRAMES: int = 10
 #: very end of cleaning (after step 7 / optional gap recovery).  Off by
 #: default — there as a safety net for A/B comparisons.
 DEFAULT_FINAL_JUMP_PASS: bool = False
+
+#: Default ``--dataname`` suffix used by ``yoto detect`` and ``yoto clean``.
+#: Matches the leading-underscore convention (e.g. produces
+#: ``<stem>_apriltagDetect14_clean.pkl``).
+DEFAULT_DATANAME: str = "_apriltagDetect14"
 
 #: Physical side length of a single AprilTag border, in millimetres.
 #: Used by :func:`yoto.cleaning.compute_pixel_scale` to convert the
@@ -213,6 +215,68 @@ def default_max_tag_id_for_family(family: str) -> int:
         MAX_VALID_TAG_ID if family == DEFAULT_TAG_FAMILY else DEFAULT_MAX_TAG_ID_OTHER
     )
 
+
+# ---------------------------------------------------------------------------
+# File discovery
+# ---------------------------------------------------------------------------
+
+#: Video file extensions recognised by the CLI and detection pipeline.
+VIDEO_EXTENSIONS: frozenset[str] = frozenset({".mp4", ".avi", ".mkv", ".mov"})
+
+#: Image file extensions recognised by the simple detection pipeline.
+IMAGE_EXTENSIONS: frozenset[str] = frozenset(
+    {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp"}
+)
+
+# ---------------------------------------------------------------------------
+# Filesystem layout
+# ---------------------------------------------------------------------------
+
+#: Name of the per-recording output sub-directory created by yoto.
+TRACKING_DIR: str = "tracking"
+
+#: Standard sub-directories created inside :data:`TRACKING_DIR`.
+TRACKING_SUBDIRS: dict[str, str] = {
+    "raw_data": "raw_data",
+    "clean_data": "clean_data",
+    "video_output": "video_output",
+    "image_output": "image_output",
+    "image_data": "data",
+    "logs": "logs",
+}
+
+# ---------------------------------------------------------------------------
+# Model weights
+# ---------------------------------------------------------------------------
+
+
+def _resolve_default_weights() -> str:
+    """Locate the default YOLO weights across source and installed layouts.
+
+    Checks, in order: the ``YOTO_WEIGHTS`` env var, weights bundled inside
+    the package, the source-tree ``<repo>/models/`` dir, and a ``models/``
+    dir under the current working directory (running from the repo root).
+    Returns the first that exists; otherwise the source-tree path, so the
+    "file not found" error names a sensible location.
+    """
+    env = os.environ.get("YOTO_WEIGHTS")
+    if env:
+        return env
+    here = os.path.dirname(__file__)
+    candidates = [
+        os.path.join(here, "models", "detect34.pt"),  # bundled in the package
+        os.path.join(here, "..", "..", "models", "detect34.pt"),  # source tree
+        os.path.join(os.getcwd(), "models", "detect34.pt"),  # run from repo root
+    ]
+    for c in candidates:
+        if os.path.isfile(c):
+            return os.path.normpath(c)
+    return os.path.normpath(candidates[1])
+
+
+#: Default YOLO weights path. Override with the ``YOTO_WEIGHTS`` env var or
+#: the ``--yoloweights`` flag.
+DEFAULT_WEIGHTS: str = _resolve_default_weights()
 
 # ---------------------------------------------------------------------------
 # Video overlay defaults
