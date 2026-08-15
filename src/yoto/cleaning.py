@@ -15,8 +15,6 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-logger = logging.getLogger(__name__)
-
 from yoto.exceptions import EmptyTrackingError
 from yoto.constants import (
     ASS_TYPE_INTERPOLATED,
@@ -28,6 +26,7 @@ from yoto.constants import (
     COL_CENTER_Y,
     COL_CORNERS,
     COL_DISTANCE,
+    CORNER_COLS,
     DEFAULT_FINAL_JUMP_PASS,
     DEFAULT_INTERPOLATION_LIMIT,
     DEFAULT_MAX_CONSECUTIVE_MISSES,
@@ -40,7 +39,17 @@ from yoto.constants import (
     DEFAULT_TAG_SIZE_MM,
     DEFAULT_YOLO_FILL_LIMIT,
     MIN_DETECTIONS_PER_ID,
+    PICKLE_EXT,
 )
+from yoto.io import (
+    corner_tag_ids,
+    find_pickle,
+    is_pickle,
+    load_corners,
+    strip_pickle_ext,
+)
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Quality metrics type
@@ -149,22 +158,23 @@ def _ensure_wide(frame_data: pd.DataFrame) -> pd.DataFrame:
 
     df = _resolve_duplicate_ids(df, frame_col)
 
-    # Pivot numeric and object columns separately so the numeric ones keep
-    # float dtype (a single pivot with mixed value types yields object dtype,
-    # which breaks np.sqrt in _compute_distances).
-    numeric_cols = [c for c in [COL_CENTER_X, COL_CENTER_Y] if c in df.columns]
-    object_cols = [c for c in [COL_CORNERS] if c in df.columns]
+    # A raw pickle written before the flat-column format stores corners as one
+    # object column of (4, 2) arrays.  Expand it here so everything downstream
+    # — and the clean pickle we write — uses a single numeric representation.
+    if COL_CORNERS in df.columns:
+        flat = load_corners(df).reshape(len(df), 8)
+        for i, name in enumerate(CORNER_COLS):
+            df[name] = flat[:, i]
+        df = df.drop(columns=COL_CORNERS)
 
-    parts = []
-    if numeric_cols:
-        num_wide = df.pivot(index=frame_col, columns="tag_id", values=numeric_cols)
-        num_wide = num_wide.astype(float)
-        parts.append(num_wide)
-    if object_cols:
-        obj_wide = df.pivot(index=frame_col, columns="tag_id", values=object_cols)
-        parts.append(obj_wide)
-
-    wide = parts[0].join(parts[1:]) if len(parts) > 1 else parts[0]
+    # Every value column is numeric, so one pivot suffices and the result keeps
+    # float dtype (a mixed-type pivot yields object dtype, which breaks
+    # np.sqrt in _compute_distances).
+    value_cols = [
+        c for c in [COL_CENTER_X, COL_CENTER_Y, *CORNER_COLS] if c in df.columns
+    ]
+    wide = df.pivot(index=frame_col, columns="tag_id", values=value_cols)
+    wide = wide.astype(float)
 
     # pivot gives (metric, tag_id); swap to (tag_id, metric)
     wide.columns = pd.MultiIndex.from_tuples(
@@ -187,6 +197,10 @@ def _interpolate_data(
 ) -> pd.DataFrame:
     """Linearly interpolate short gaps in all numeric columns.
 
+    Corner columns are excluded: a quad is a measurement, not a position
+    estimate, so interpolating one produces a tag outline that no longer
+    matches its own ``center_x`` / ``center_y``.
+
     Parameters
     ----------
     frame_data : pd.DataFrame
@@ -200,6 +214,8 @@ def _interpolate_data(
         DataFrame with gaps of at most *limit* frames filled.
     """
     for col in frame_data.columns:
+        if (col[-1] if isinstance(col, tuple) else col) in CORNER_COLS:
+            continue
         if pd.api.types.is_numeric_dtype(frame_data[col]):
             frame_data[col] = frame_data[col].interpolate(
                 method="linear",
@@ -602,9 +618,9 @@ def _fill_via_yolo(
 
     # Deliberately do NOT share a claimed_per_frame between forward and
     # backward here: cross-pass collisions are the *signal*
-    # ``_prune_ambiguous_tracklets`` (step 6c) uses to detect drift
+    # ``_prune_ambiguous_tracklets`` (step 6b) uses to detect drift
     # (e.g. tag A walking over tag B and the chains swapping IDs).
-    # Removing them here breaks the detection.  The re-chain (step 6d)
+    # Removing them here breaks the detection.  The re-chain (step 6c)
     # is where we DO share the claim set, so it doesn't re-introduce
     # duplicates after the prune.
     filled_fwd, claims_fwd = _chain_pass(
@@ -921,7 +937,7 @@ def _recover_long_gaps(
     on a single frame.
 
     Tracks **box IDs** (not positions) to avoid re-claiming a YOLO box
-    already used by another tag in steps 6a/6d/6f.  Boxes claimed by
+    already used by another tag in steps 6a/6c/6e.  Boxes claimed by
     the forward walk are added to ``claimed`` so the backward walk
     can't grab the same box for the same tag.
 
@@ -1132,9 +1148,9 @@ def compute_pixel_scale(
     AprilTags have a known physical side length (``tag_size_mm``).  By
     measuring the side length of decoded tags in pixels we can recover
     the imaging scale of the recording.  The four corners of each
-    decoded tag are stored as ``(lb, rb, rt, lt)`` 4x2 arrays in the
-    ``COL_CORNERS`` column; we measure all four sides and take the
-    median over a stratified sample.
+    decoded tag are stored as ``(lb, rb, rt, lt)`` coordinates in the
+    :data:`~yoto.constants.CORNER_COLS` columns; we measure all four sides
+    and take the median over a stratified sample.
 
     The sample is stratified across both axes so the estimate is robust
     to (a) per-ID bias (a single tag with consistently misdecoded
@@ -1147,8 +1163,8 @@ def compute_pixel_scale(
     Parameters
     ----------
     frame_data : pd.DataFrame
-        Raw or partially-cleaned detection DataFrame with the
-        ``COL_CORNERS`` sub-column for each tag.
+        Raw or partially-cleaned detection DataFrame carrying corner
+        coordinates for each tag, in either storage format.
     tag_size_mm : float
         Physical side length of one AprilTag border, in millimetres.
     sample_size : int
@@ -1162,15 +1178,8 @@ def compute_pixel_scale(
         ``(nan, nan, 0)`` if no usable corners are present.
     """
     frame_data = _ensure_wide(frame_data)
-    if COL_CORNERS not in frame_data.columns.get_level_values(1):
-        return float("nan"), float("nan"), 0
-
-    id_list = np.unique(
-        frame_data.columns[
-            frame_data.columns.get_level_values(1) == COL_CORNERS
-        ].get_level_values(0)
-    )
-    if len(id_list) == 0:
+    id_list = corner_tag_ids(frame_data)
+    if not id_list:
         return float("nan"), float("nan"), 0
 
     per_tag = (
@@ -1180,24 +1189,18 @@ def compute_pixel_scale(
     sides: list[float] = []
     n_samples = 0
     for tag_id in id_list:
-        col = frame_data[(tag_id, COL_CORNERS)]
-        valid_idx = np.flatnonzero(col.notna().to_numpy())
+        quads = load_corners(frame_data, tag_id).astype(float)
+        valid_idx = np.flatnonzero(np.isfinite(quads).all(axis=(1, 2)))
         if len(valid_idx) == 0:
             continue
         if per_tag > 0 and len(valid_idx) > per_tag:
             pick = np.linspace(0, len(valid_idx) - 1, per_tag).astype(int)
             valid_idx = valid_idx[pick]
-        for i in valid_idx:
-            corners = col.iloc[int(i)]
-            if corners is None:
-                continue
-            arr = np.asarray(corners, dtype=float)
-            if arr.shape != (4, 2) or not np.all(np.isfinite(arr)):
-                continue
-            # 4 side lengths: lb→rb, rb→rt, rt→lt, lt→lb
-            diffs = np.diff(arr[[0, 1, 2, 3, 0]], axis=0)
-            sides.extend(np.sqrt((diffs * diffs).sum(axis=1)).tolist())
-            n_samples += 1
+        # 4 side lengths per tag: lb→rb, rb→rt, rt→lt, lt→lb
+        picked = quads[valid_idx]
+        diffs = np.diff(picked[:, [0, 1, 2, 3, 0], :], axis=1)
+        sides.extend(np.sqrt((diffs * diffs).sum(axis=2)).ravel().tolist())
+        n_samples += len(valid_idx)
 
     if not sides:
         return float("nan"), float("nan"), 0
@@ -1236,17 +1239,17 @@ def clean_tracking_data(
        a. YOLO-fill — forward+backward chain matching to undecoded boxes.
           Search radius: ``tag_size_px * tag_size_multiplier`` where
           ``tag_size_px`` is the median tag side length in pixels.
-       c. Detect *ambiguity* events (same ``(frame, box_id)`` claimed by
+       b. Detect *ambiguity* events (same ``(frame, box_id)`` claimed by
           two or more different tags — typically forward+backward
           cross-pass collisions where both chains matched the same
           shared YOLO box).  For each tag involved, clear every
           non-ORIGINAL cell between the surrounding ORIGINALs and add
           the ambiguous box to that tag's forbidden set.
-       d. Re-chain on the pruned state with per-tag forbidden sets;
+       c. Re-chain on the pruned state with per-tag forbidden sets;
           *rechain_affected_only* restricts candidates to tags that
-          had cells pruned in step c.
-       e. Recompute distances.
-       f. Final jump deletion (safety net for residual mistakes).
+          had cells pruned in step b.
+       d. Recompute distances.
+       e. Final jump deletion (safety net for residual mistakes).
     7. *(Optional, experimental — gated by* ``recover_long_gaps`` *)*:
        For each tag with a NaN gap longer than *min_gap_recovery_frames*,
        match each gap frame to the closest unclaimed undecoded YOLO box
@@ -1283,8 +1286,8 @@ def clean_tracking_data(
     max_consecutive_misses : int
         Chain breaks after this many consecutive missed frames.
     rechain_affected_only : bool
-        When True, restrict re-chain candidates (step 6d) to tags that
-        had cells pruned in step 6c.  Default False (all tags compete).
+        When True, restrict re-chain candidates (step 6c) to tags that
+        had cells pruned in step 6b.  Default False (all tags compete).
     recover_long_gaps : bool
         Experimental.  When True, run the step-8 long-gap recovery.
     min_gap_recovery_frames : int
@@ -1408,7 +1411,7 @@ def clean_tracking_data(
         )
         _maybe_save_snapshot(frame_data, debug_snapshot_dir, "step6a_after_fill")
 
-        # --- Step 6c: prune ambiguous tracklets ---
+        # --- Step 6b: prune ambiguous tracklets ---
         # Detect (frame, box_id) entries claimed by 2+ tags in the
         # merged forward+backward claims (forward gives box B to tag
         # A; backward independently gives the same box to tag B —
@@ -1420,11 +1423,11 @@ def clean_tracking_data(
             _prune_ambiguous_tracklets(frame_data, id_list, claims)
         )
         yolo_pruned_count += ambig_pruned
-        _maybe_save_snapshot(frame_data, debug_snapshot_dir, "step6c_after_prune")
+        _maybe_save_snapshot(frame_data, debug_snapshot_dir, "step6b_after_prune")
 
-        # --- Step 6d: re-chain on current state (no reset) ---
+        # --- Step 6c: re-chain on current state (no reset) ---
         # Keeps all existing YOLO_INFERRED; only fills new gaps and
-        # excludes the per-tag forbidden boxes from step 6c.
+        # excludes the per-tag forbidden boxes from step 6b.
         candidate_tag_indices: set[int] | None = (
             affected_tag_indices if rechain_affected_only else None
         )
@@ -1468,9 +1471,9 @@ def clean_tracking_data(
             claimed_per_frame=claimed_per_frame,
         )
         _writeback_tag_arrays(frame_data, id_list, x_arr, y_arr, t_arr)
-        _maybe_save_snapshot(frame_data, debug_snapshot_dir, "step6d_after_rechain")
+        _maybe_save_snapshot(frame_data, debug_snapshot_dir, "step6c_after_rechain")
 
-        # --- Step 6e: recompute distances after re-chain ---
+        # --- Step 6d: recompute distances after re-chain ---
         existing_dist = [
             (tid, COL_DISTANCE)
             for tid in id_list
@@ -1480,17 +1483,17 @@ def clean_tracking_data(
             frame_data = frame_data.drop(columns=existing_dist)
         frame_data = _compute_distances(frame_data, id_list)
 
-        # --- Step 6f: final jump deletion ---
-        before_6f = (
+        # --- Step 6e: final jump deletion ---
+        before_6e = (
             frame_data.xs(COL_CENTER_X, axis=1, level=1)[id_list].notna().values.copy()
         )
         for tag_id in id_list:
             frame_data, _ = _delete_jump_blocks(
                 frame_data, tag_id, max_distance=max_jump_distance
             )
-        after_6f = frame_data.xs(COL_CENTER_X, axis=1, level=1)[id_list].notna().values
-        jump_deleted_count += int((before_6f & ~after_6f).sum())
-        _maybe_save_snapshot(frame_data, debug_snapshot_dir, "step6f_after_jump")
+        after_6e = frame_data.xs(COL_CENTER_X, axis=1, level=1)[id_list].notna().values
+        jump_deleted_count += int((before_6e & ~after_6e).sum())
+        _maybe_save_snapshot(frame_data, debug_snapshot_dir, "step6e_after_jump")
 
     # --- Step 7 (experimental): long-gap recovery ---
     # Runs on raw NaN gaps (no prior interpolation), so the gap boundaries
@@ -1544,6 +1547,18 @@ def clean_tracking_data(
             (tag_id, COL_CENTER_X)
         ].notna()
         frame_data.loc[mask, (tag_id, COL_ASS_TYPE)] = ASS_TYPE_INTERPOLATED
+
+    # Corners only mean something on an ORIGINAL decode.  Jump deletion
+    # (step 5/8) clears center_x/y but not the quad, and YOLO-fill gives a
+    # row a center with no quad of its own, so drop every corner that no
+    # longer belongs to the row's provenance.
+    for tag_id in id_list:
+        corner_cols = [
+            (tag_id, c) for c in CORNER_COLS if (tag_id, c) in frame_data.columns
+        ]
+        if corner_cols:
+            stale = frame_data[(tag_id, COL_ASS_TYPE)] != ASS_TYPE_ORIGINAL
+            frame_data.loc[stale, corner_cols] = np.nan
 
     existing_dist = [
         (tid, COL_DISTANCE)
@@ -1691,15 +1706,19 @@ def clean_video(
     from yoto.constants import TRACKING_DIR, TRACKING_SUBDIRS
 
     # Accept a video path — resolve to the raw pickle.
-    if not pkl_path.endswith(".pkl"):
+    if not is_pickle(pkl_path):
         stem = os.path.splitext(os.path.basename(pkl_path))[0]
         recording_dir = os.path.dirname(os.path.abspath(pkl_path))
-        pkl_path = os.path.join(
+        base = os.path.join(
             recording_dir,
             TRACKING_DIR,
             TRACKING_SUBDIRS["raw_data"],
-            f"{stem}{data_suffix}.pkl",
+            f"{stem}{data_suffix}",
         )
+        found = find_pickle(base)
+        if found is None:
+            raise FileNotFoundError(f"Raw pickle not found: {base}[.pkl.zst|.pkl]")
+        pkl_path = found
 
     if not os.path.isfile(pkl_path):
         raise FileNotFoundError(f"Raw pickle not found: {pkl_path}")
@@ -1712,8 +1731,8 @@ def clean_video(
     # Auto-discover the _yolo.pkl sidecar.
     undecoded_df = None
     if yolo_fill:
-        yolo_path = pkl_path[:-4] + "_yolo.pkl"
-        if os.path.isfile(yolo_path):
+        yolo_path = find_pickle(strip_pickle_ext(pkl_path) + "_yolo")
+        if yolo_path is not None:
             yolo_df = pd.read_pickle(yolo_path)
             undecoded_df = yolo_df[~yolo_df["decoded"].astype(bool)].copy()
             print(
@@ -1737,8 +1756,10 @@ def clean_video(
             recording_dir, TRACKING_DIR, TRACKING_SUBDIRS["clean_data"]
         )
         os.makedirs(clean_dir, exist_ok=True)
-        stem = os.path.splitext(os.path.basename(pkl_path))[0]
-        output_path = os.path.join(clean_dir, f"{stem}_clean.pkl")
+        # strip_pickle_ext, not splitext: splitext leaves the '.pkl' of a
+        # '.pkl.zst' name behind, producing '<stem>.pkl_clean.pkl.zst'.
+        stem = strip_pickle_ext(os.path.basename(pkl_path))
+        output_path = os.path.join(clean_dir, f"{stem}_clean{PICKLE_EXT}")
 
     cleaned, _id_list, metrics = clean_tracking_data(
         frame_data,

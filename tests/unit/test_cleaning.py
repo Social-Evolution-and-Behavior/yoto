@@ -14,6 +14,7 @@ from yoto.cleaning import (
     clean_tracking_data,
     compute_pixel_scale,
 )
+from yoto.io import load_corners
 from yoto.constants import (
     ASS_TYPE_INTERPOLATED,
     ASS_TYPE_NONE,
@@ -25,6 +26,7 @@ from yoto.constants import (
     COL_CORNERS,
     COL_DISTANCE,
     COL_FRAME,
+    CORNER_COLS,
 )
 
 
@@ -411,6 +413,80 @@ class TestCleanTrackingDataWithYoloFill:
         # Counters exist and are non-negative.
         assert metrics["yolo_pruned_count"] >= 0
         assert metrics["yolo_rechained_count"] >= 0
+
+
+class TestCornerProvenance:
+    """Corners must survive only on ORIGINAL rows.
+
+    A quad is a measurement of where the tag physically was.  Interpolating
+    one, or leaving one behind after a jump block is deleted, produces an
+    outline that no longer matches its own center_x / center_y — before this
+    was enforced, interpolated quads drifted hundreds of pixels away from
+    their tag centre.
+    """
+
+    @staticmethod
+    def _raw(n_frames: int, missing: range) -> pd.DataFrame:
+        """Two tags walking right at 1 px/frame; tag 1 absent on *missing*.
+
+        Tag 2 is present on every frame so the wide index still covers the
+        gap — otherwise there would be no row for tag 1 to interpolate into.
+        """
+        rows = []
+        for f in range(n_frames):
+            for tag_id, y in ((1, 100.0), (2, 300.0)):
+                if tag_id == 1 and f in missing:
+                    continue
+                cx, cy = 100.0 + f, y
+                rows.append(
+                    {
+                        COL_FRAME: f,
+                        "tag_id": tag_id,
+                        COL_CENTER_X: cx,
+                        COL_CENTER_Y: cy,
+                        "c0x": cx - 5.0,
+                        "c0y": cy - 5.0,
+                        "c1x": cx + 5.0,
+                        "c1y": cy - 5.0,
+                        "c2x": cx + 5.0,
+                        "c2y": cy + 5.0,
+                        "c3x": cx - 5.0,
+                        "c3y": cy + 5.0,
+                    }
+                )
+        return pd.DataFrame(rows).set_index(COL_FRAME)
+
+    def test_interpolated_rows_have_no_corners(self) -> None:
+        cleaned, _, _ = clean_tracking_data(
+            self._raw(40, range(10, 13)), min_detections=1, interpolation_limit=5
+        )
+        ass = cleaned[(1, COL_ASS_TYPE)]
+        assert (ass.iloc[10:13] == ASS_TYPE_INTERPOLATED).all()
+        quads = load_corners(cleaned, tag_id=1)
+        filled = ass == ASS_TYPE_ORIGINAL
+        assert np.isnan(quads[~filled.to_numpy()]).all()
+        assert np.isfinite(quads[filled.to_numpy()]).all()
+
+    def test_surviving_corners_still_match_their_centre(self) -> None:
+        cleaned, _, _ = clean_tracking_data(
+            self._raw(40, range(10, 13)), min_detections=1, interpolation_limit=5
+        )
+        quads = load_corners(cleaned, tag_id=1)
+        keep = np.isfinite(quads).all(axis=(1, 2))
+        centroid_x = quads[keep, :, 0].mean(axis=1)
+        assert centroid_x == pytest.approx(cleaned[(1, COL_CENTER_X)].to_numpy()[keep])
+
+    def test_legacy_corners_column_input_is_also_masked(self) -> None:
+        raw = self._raw(40, range(10, 13))
+        flat = raw[list(CORNER_COLS)].to_numpy().reshape(-1, 4, 2)
+        raw = raw.drop(columns=list(CORNER_COLS))
+        raw[COL_CORNERS] = pd.Series(list(flat), index=raw.index, dtype=object)
+        cleaned, _, _ = clean_tracking_data(
+            raw, min_detections=1, interpolation_limit=5
+        )
+        ass = cleaned[(1, COL_ASS_TYPE)]
+        quads = load_corners(cleaned, tag_id=1)
+        assert np.isnan(quads[(ass != ASS_TYPE_ORIGINAL).to_numpy()]).all()
 
 
 class TestComputePixelScale:

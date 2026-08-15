@@ -16,10 +16,14 @@ import cv2
 import numpy as np
 import pandas as pd
 
-from yoto.constants import TRACKING_DIR, default_max_tag_id_for_family
+from yoto.io import has_corners, load_corners
+from yoto.constants import (
+    PICKLE_EXTS,
+    TRACKING_DIR,
+    TRAINING_SUBDIR,
+    default_max_tag_id_for_family,
+)
 
-#: Shared base for every ``yoto train`` tool's output, under ``tracking/``.
-TRAINING_SUBDIR = "training"
 #: This tool's sub-directory under ``tracking/training/``.
 OUT_SUBDIR = "yolo_dataset"
 
@@ -141,22 +145,18 @@ def read_pkl_stats(pkl_path: str | Path) -> tuple[pd.Series, list[np.ndarray]]:
     one-row-per-detection schema produced by newer yoto versions.
     """
     df = pd.read_pickle(pkl_path)
-    corners: list[np.ndarray] = []
 
     if isinstance(df.columns, pd.MultiIndex):
         counts = df.loc[:, (slice(None), "center_x")].notna().sum(axis=1)
-        for col in [c for c in df.columns if c[1] == "corners"]:
-            for v in df[col].dropna():
-                arr = np.asarray(v, dtype=np.float64)
-                if arr.shape == (4, 2) and np.isfinite(arr).all():
-                    corners.append(arr)
     else:
         counts = df.groupby(level=0).size()
-        if "corners" in df.columns:
-            for v in df["corners"].dropna():
-                arr = np.asarray(v, dtype=np.float64)
-                if arr.shape == (4, 2) and np.isfinite(arr).all():
-                    corners.append(arr)
+
+    if has_corners(df):
+        quads = load_corners(df).astype(np.float64).reshape(-1, 4, 2)
+        quads = quads[np.isfinite(quads).all(axis=(1, 2))]
+        corners = list(quads)
+    else:
+        corners = []
 
     return counts.astype(int), corners
 
@@ -189,7 +189,11 @@ class Experiment:
 
 
 #: Sidecar pkls that are not the decoded-tags pkl (skipped in discovery).
-_SIDECAR_SUFFIXES = ("_yolo.pkl", "_quads.pkl")
+#: Listed for every pickle extension, since compressed and plain pickles
+#: coexist across yoto versions.
+_SIDECAR_SUFFIXES = tuple(
+    f"{kind}{ext}" for kind in ("_yolo", "_quads") for ext in PICKLE_EXTS
+)
 
 
 def find_pkls_for_video(video: Path) -> list[Path]:
@@ -198,7 +202,8 @@ def find_pkls_for_video(video: Path) -> list[Path]:
         return []
     return sorted(
         p
-        for p in raw.glob(f"{video.stem}*.pkl")
+        for ext in PICKLE_EXTS
+        for p in raw.glob(f"{video.stem}*{ext}")
         if not p.name.endswith(_SIDECAR_SUFFIXES)
     )
 
@@ -287,11 +292,17 @@ def save_session(path: Path, session: dict) -> None:
 
 
 def set_decision(
-    session: dict, frame: int, status: str, overrides: dict[int, str]
+    session: dict,
+    frame: int,
+    status: str,
+    overrides: dict[int, str],
+    *,
+    enhance: bool = False,
 ) -> None:
     session["frames"][str(frame)] = {
         "status": status,
         "overrides": {str(k): v for k, v in overrides.items()},
+        "enhance": bool(enhance),
     }
 
 
@@ -320,10 +331,15 @@ def final_quad_indices(
 # --------------------------------------------------------------------------- #
 
 
-def labelme_shape(
+def xanylabeling_shape(
     corners: np.ndarray, label: str = "apriltag", score: float = 1.0
 ) -> dict:
     pts = np.asarray(corners, dtype=np.float64).reshape(4, 2)
+    # X-AnyLabeling rotation shapes carry a `direction`: the heading of the
+    # points[0]->points[1] edge in radians, normalised to [0, 2*pi). Without it
+    # the box loads flat (direction 0) and its rotation handle is wrong.
+    (x1, y1), (x2, y2) = pts[0], pts[1]
+    direction = float(np.arctan2(y2 - y1, x2 - x1)) % (2.0 * np.pi)
     return {
         "label": label,
         "score": float(score),
@@ -332,6 +348,7 @@ def labelme_shape(
         "description": None,
         "difficult": False,
         "shape_type": "rotation",
+        "direction": direction,
         "flags": {},
         "attributes": {},
     }
@@ -375,12 +392,25 @@ def write_data_yaml(path: Path, class_name: str = "apriltag") -> None:
 
 
 def detect_full_frame(
-    gray: np.ndarray, params: dict[str, Any], detector: Any
+    gray: np.ndarray,
+    params: dict[str, Any],
+    detector: Any,
+    *,
+    enhance: bool = False,
 ) -> tuple[list[dict], list[np.ndarray]]:
+    """Detect tags + raw quads on a full frame.
+
+    ``enhance=False`` (the default) runs the AprilTag detector on the raw
+    grayscale frame, matching what you get testing the detector by hand.
+    ``enhance=True`` applies the fast pipeline's sharpen/contrast pre-stages
+    (``_enhance_and_detect``) first — more candidate quads, but the picture
+    diverges from the raw frame.
+    """
     from yoto.detection import _enhance_and_detect
 
     max_tag_id = default_max_tag_id_for_family(params.get("_family", "tag36ARTag"))
-    tags, quads = _enhance_and_detect(gray, params, detector, save_quads=True)
+    det_params = params if enhance else {**params, "no_enhance": True}
+    tags, quads = _enhance_and_detect(gray, det_params, detector, save_quads=True)
     return [t for t in tags if t["id"] <= max_tag_id], quads
 
 
@@ -504,6 +534,7 @@ def precompute_experiment(
             {
                 "image_width": img_w,
                 "image_height": img_h,
+                "family": family,
                 "thresholds": dict(thr),
                 "frame_stats": frame_stats,
                 "frames": [int(f) for f in frame_ids],
@@ -521,7 +552,17 @@ def run_export(
     out_dir: Path,
     formats: list[str],
     val_fraction: float,
+    *,
+    redetect: Callable[[str, int], list[dict]] | None = None,
 ) -> int:
+    """Write the accepted frames as a YOLO dataset.
+
+    ``redetect`` — when a frame's decision was made with the *Enhance* toggle
+    on, its cached (raw) candidates no longer match what the reviewer saw. If
+    provided, ``redetect(exp, frame)`` re-detects that frame with enhancement
+    and returns candidate dicts (``quad_idx`` + ``corners``) so the exported
+    labels are the enhanced quads the reviewer actually curated.
+    """
     ds = Path(out_dir) / "dataset"
     accepted: list[tuple[str, int, dict]] = []
     for exp in cache:
@@ -534,11 +575,14 @@ def run_export(
     written = 0
     for exp, frame, dec in accepted:
         c = cache[exp]
-        sub = c["df"][c["df"]["frame"] == frame]
-        cands = [
-            {"quad_idx": int(r.quad_idx), "corners": np.asarray(r.corners)}
-            for r in sub.itertuples()
-        ]
+        if dec.get("enhance") and redetect is not None:
+            cands = redetect(exp, frame)
+        else:
+            sub = c["df"][c["df"]["frame"] == frame]
+            cands = [
+                {"quad_idx": int(r.quad_idx), "corners": np.asarray(r.corners)}
+                for r in sub.itertuples()
+            ]
         overrides = {int(k): v for k, v in dec.get("overrides", {}).items()}
         keep = final_quad_indices(cands, thr, None, overrides)
         quads = [
@@ -563,13 +607,13 @@ def run_export(
             (lbl_dir / f"{name}.txt").write_text(
                 "\n".join(yolo_axis_line(q, w, h) for q in quads) + "\n"
             )
-        if "labelme" in formats:
+        if "xanylabeling" in formats:
             (img_dir / f"{name}.json").write_text(
                 json.dumps(
                     {
                         "version": "3.3.5",
                         "flags": {},
-                        "shapes": [labelme_shape(q) for q in quads],
+                        "shapes": [xanylabeling_shape(q) for q in quads],
                         "imagePath": f"{name}.jpg",
                         "imageData": None,
                         "imageHeight": h,

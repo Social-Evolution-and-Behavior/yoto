@@ -13,7 +13,7 @@ authors = [
     { name = "Yohann Chemtob" },
 ]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
@@ -31,12 +31,23 @@ dependencies = [
     "ultralytics>=8.0",
     "fastapi>=0.110",
     "uvicorn[standard]>=0.27",
+    # Pipeline pickles are zstd-compressed; pandas needs this to read them.
+    "zstandard>=0.21",
+    # Ultralytics pulls torch in transitively, but the GPU-resident pipeline
+    # imports it directly, so depend on it explicitly.
+    "torch>=2.0",
+    # NVDEC hardware decoding.  `detect` defaults to --use-nvdec True and
+    # imports this unconditionally, so it is not optional.
+    "pynvvideocodec>=2.0",
+    # `yoto train optimize-preset`.
+    "optuna>=3.0",
+    "plotly>=5.0",
 ]
 
 [project.optional-dependencies]
-fast = [
-    "torch>=2.0",
-    "pynvvideocodec>=2.0",
+# Alternative YOLO weight formats.  The bundled default weights are `.pt`,
+# which goes through the standard Ultralytics path and needs neither of these.
+engines = [
     "tensorrt>=8.6",
     "onnxruntime-gpu>=1.17",
 ]
@@ -45,6 +56,9 @@ dev = [
     "pytest-cov>=4.0",
     "pytest-mock>=3.10",
     "hypothesis>=6.80",
+    # starlette's TestClient (used by the yolo_dataset server tests) refuses to
+    # import without it; older starlette accepted httpx instead.
+    "httpx2>=2.10",
 ]
 docs = [
     "mkdocs-material>=9.0",
@@ -57,11 +71,6 @@ lint = [
     "mypy>=1.5",
     "vulture>=2.7",
 ]
-tune = [
-    "optuna>=3.0",
-    "plotly>=5.0",
-]
-
 [project.scripts]
 yoto = "yoto.cli:main"
 
@@ -80,6 +89,14 @@ version-file = "src/yoto/_version.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/yoto"]
+
+# Bundle the committed default YOLO weights into the wheel so an installed
+# `yoto` finds them at <site-packages>/yoto/models/detect34.pt (candidate #1
+# in _resolve_default_weights) regardless of the working directory it runs
+# from.  The source file lives at the repo-root models/ dir; force-include
+# copies it under the package on build.
+[tool.hatch.build.targets.wheel.force-include]
+"models/detect34.pt" = "yoto/models/detect34.pt"
 
 # ---------------------------------------------------------------------------
 # Black
@@ -101,6 +118,10 @@ module = [
     "ultralytics.*",
     "PyNvVideoCodec.*",
     "cv2.*",
+    # pandas-stubs / types-tqdm are deliberately not required: they surface
+    # hundreds of new errors under a non-strict config for no real safety win.
+    "pandas.*",
+    "tqdm.*",
 ]
 ignore_missing_imports = true
 

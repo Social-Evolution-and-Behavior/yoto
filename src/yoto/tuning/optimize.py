@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """Optuna-based AprilTag preset optimizer.
 
 Three search-space tiers control how many parameters Optuna explores:
@@ -14,6 +12,8 @@ Three search-space tiers control how many parameters Optuna explores:
 The output JSON is consumable directly by ``yoto detect --apriltag-preset``.
 """
 
+from __future__ import annotations
+
 import json
 import os
 import shutil
@@ -26,7 +26,6 @@ from pathlib import Path
 from typing import Any
 
 import cv2
-import numpy as np
 
 from .preprocess import disk_blur_augment, preprocess_composite
 
@@ -109,7 +108,8 @@ class _LiveDisplay:
                     f"  ★ BEST  trial {best_num}  score={best_val:.4f}"
                     f"  recall={a.get('individual_recall', 0):.4f}"
                     f"  FP={a.get('false_positive_rate', 0):.4f}"
-                    f"  found={a.get('individual_found', '?')}/{a.get('total_gt_ids', '?')}",
+                    f"  found={a.get('individual_found', '?')}"
+                    f"/{a.get('total_gt_ids', '?')}",
                     "    params: "
                     + "  ".join(
                         f"{k}={v}" for k, v in sorted(best_trial.params.items())
@@ -409,7 +409,10 @@ def subsample_testset(
 def _assign_tag_to_crop(
     cx: float, cy: float, crops: list[dict[str, Any]], scale: float = 1.0
 ) -> int:
-    """Map a detected tag centre (in possibly upscaled composite coords) to a crop index."""
+    """Map a detected tag centre to a crop index.
+
+    Centre coordinates may be in upscaled composite space.
+    """
     for c in crops:
         x_start = c["canvas_x_offset"] * scale
         x_end = x_start + c["crop_shape"][1] * scale
@@ -1338,5 +1341,299 @@ def optimize_preset(
             )
         except Exception as exc:
             print(f"[viz] failed: {exc}")
+
+    return out_path
+
+
+# ---------------------------------------------------------------------------
+# Single-image / image-folder preset optimisation (no testset, no GT)
+# ---------------------------------------------------------------------------
+
+IMAGE_SUFFIXES = frozenset({".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"})
+
+
+def _load_image_paths(image_path: str | Path) -> list[Path]:
+    """Resolve *image_path* to a sorted list of image files.
+
+    Accepts a single image file or a directory (non-recursive) of images.
+    """
+    p = Path(image_path)
+    if p.is_dir():
+        files = sorted(f for f in p.iterdir() if f.suffix.lower() in IMAGE_SUFFIXES)
+        if not files:
+            raise FileNotFoundError(f"No image files found in {p}")
+        return files
+    if p.is_file():
+        return [p]
+    raise FileNotFoundError(f"No such image or directory: {p}")
+
+
+def _image_score(distinct: int, duplicate: int) -> float:
+    """Image-mode objective: total distinct decodes, minus a small penalty for
+    duplicate (same-ID-twice) decodes, which usually signal a misdecode since
+    each physical tag is unique."""
+    return float(distinct) - 0.2 * float(duplicate)
+
+
+def _evaluate_images(
+    images: list[Path],
+    preprocess_params: dict[str, Any],
+    detector_params: dict[str, Any],
+    tag_family: str,
+    *,
+    trial: Any = None,
+    prune_eval_interval: int = 10,
+    max_tag_id: int = 9999,
+    silence_ids: frozenset[int] = frozenset(),
+    synthetic_blur: bool = False,
+) -> dict[str, Any]:
+    """Decode every image and count distinct tag IDs found.
+
+    Runs ``preprocess_composite`` then the AprilTag decoder on each full image
+    (no crops, no ground truth).  Returns per-run metrics; the optimisation
+    objective is :func:`_image_score`.
+    """
+    import apriltag
+
+    detector = apriltag.apriltag(
+        family=tag_family,
+        threads=1,
+        maxhamming=int(detector_params["max_hamming"]),
+        decimate=float(detector_params["decimate"]),
+        blur=float(detector_params["blur"]),
+        refine_edges=int(detector_params["refine_edges"]),
+        decode_sharpening=float(detector_params["decode_sharpening"]),
+    )
+
+    total_distinct = total_duplicate = 0
+    n_images = 0
+    total_pre = total_det = 0.0
+    wall_start = time.perf_counter()
+
+    for img_path in images:
+        composite = cv2.imread(str(img_path))
+        if composite is None:
+            continue
+        n_images += 1
+        if synthetic_blur:
+            composite = disk_blur_augment(composite)
+
+        t_pre = time.perf_counter()
+        enhanced = preprocess_composite(composite, preprocess_params)
+        total_pre += time.perf_counter() - t_pre
+
+        t_det = time.perf_counter()
+        raw_tags = detector.detect(enhanced)
+        total_det += time.perf_counter() - t_det
+
+        ids = [
+            int(t["id"])
+            for t in raw_tags
+            if int(t["id"]) <= max_tag_id and int(t["id"]) not in silence_ids
+        ]
+        distinct = set(ids)
+        total_distinct += len(distinct)
+        total_duplicate += len(ids) - len(distinct)
+
+        if trial is not None and n_images % max(prune_eval_interval, 1) == 0:
+            import optuna
+
+            trial.report(_image_score(total_distinct, total_duplicate), step=n_images)
+            if trial.should_prune():
+                raise optuna.TrialPruned()
+
+    n = max(n_images, 1)
+    avg_pre = 1000 * total_pre / n
+    avg_det = 1000 * total_det / n
+    all_decodes = total_distinct + total_duplicate
+    return {
+        "distinct_decodes": total_distinct,
+        "duplicate_decodes": total_duplicate,
+        "n_images": n_images,
+        "avg_distinct_per_image": total_distinct / n,
+        # Aliases so the shared _LiveDisplay reads sensibly: "found" shows
+        # distinct out of all raw decodes; "fp_n" shows duplicate decodes.
+        "individual_recall": total_distinct / max(all_decodes, 1),
+        "individual_found": total_distinct,
+        "total_gt_ids": all_decodes,
+        "false_positives": total_duplicate,
+        "false_positive_rate": total_duplicate / max(all_decodes, 1),
+        "avg_preprocess_ms": avg_pre,
+        "avg_detect_ms": avg_det,
+        "avg_total_ms": avg_pre + avg_det,
+        "eval_wall_s": time.perf_counter() - wall_start,
+    }
+
+
+def _objective_images(
+    trial: Any,
+    images: list[Path],
+    search_space: str,
+    tag_family: str,
+    prune_eval_interval: int,
+    max_tag_id: int,
+    silence_ids: frozenset[int],
+    synthetic_blur: bool,
+) -> float:
+    pre, det = _SUGGESTERS[search_space](trial)
+    metrics = _evaluate_images(
+        images,
+        pre,
+        det,
+        tag_family=tag_family,
+        trial=trial,
+        prune_eval_interval=prune_eval_interval,
+        max_tag_id=max_tag_id,
+        silence_ids=silence_ids,
+        synthetic_blur=synthetic_blur,
+    )
+    for k, v in metrics.items():
+        trial.set_user_attr(k, v)
+    return _image_score(
+        metrics.get("distinct_decodes", 0),
+        metrics.get("duplicate_decodes", 0),
+    )
+
+
+def optimize_preset_images(
+    image_path: str | Path,
+    *,
+    out_dir: str | Path | None = None,
+    search_space: str = "standard",
+    n_trials: int = 300,
+    n_jobs: int = 1,
+    tag_family: str = "tag36ARTag",
+    study_name: str = "yoto_preset_image",
+    storage: str | None = None,
+    seed_params: str | Path | None = None,
+    pruner_startup_trials: int = 40,
+    pruner_warmup_steps: int = 0,
+    prune_eval_interval: int = 10,
+    max_tag_id: int = 9999,
+    silence_ids: frozenset[int] = frozenset(),
+    synthetic_blur: bool = False,
+) -> Path:
+    """Optimise an AprilTag preset directly on one image or a folder of images.
+
+    Unlike :func:`optimize_preset`, this needs no testset and no ground truth:
+    it maximises the number of *distinct* tag IDs decoded across the image(s)
+    (lightly penalising duplicate decodes).  The written
+    ``best_params_<study_name>.json`` is consumable by
+    ``yoto detect --apriltag-preset``.
+
+    Returns the path to the written best-params JSON.
+    """
+    import optuna
+
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+    if search_space not in _SUGGESTERS:
+        raise ValueError(
+            f"search_space must be one of {list(_SUGGESTERS)}; got {search_space!r}"
+        )
+
+    images = _load_image_paths(image_path)
+    out_path_dir = Path(out_dir) if out_dir else Path(image_path)
+    if out_path_dir.is_file():
+        out_path_dir = out_path_dir.parent
+    out_path_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"Loaded {len(images)} image(s) from {image_path}")
+    print(
+        f"  search_space={search_space}  tag_family={tag_family}  "
+        f"n_trials={n_trials}  n_jobs={n_jobs}"
+    )
+    print(
+        "\n  " + "!" * 56 + "\n"
+        "  !!  IMAGE MODE — no ground truth.                       !!\n"
+        "  !!  Maximising the number of DISTINCT tag IDs decoded   !!\n"
+        "  !!  across the image(s), NOT accuracy. Verify the       !!\n"
+        "  !!  winning preset with 'yoto detect' before trusting.  !!\n"
+        "  " + "!" * 56 + "\n"
+    )
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        sampler = optuna.samplers.TPESampler(multivariate=True, group=True, seed=42)
+
+    study = optuna.create_study(
+        study_name=study_name,
+        storage=make_storage(storage),
+        direction="maximize",
+        load_if_exists=True,
+        sampler=sampler,
+        pruner=optuna.pruners.MedianPruner(
+            n_startup_trials=pruner_startup_trials,
+            n_warmup_steps=pruner_warmup_steps,
+        ),
+    )
+
+    if seed_params is not None:
+        with open(seed_params) as f:
+            blob = json.load(f)
+        seed = dict(blob.get("params", blob))
+        try:
+            study.enqueue_trial(seed, skip_if_exists=True)
+            print(f"  Seeded with params from {seed_params}")
+        except Exception as exc:
+            print(f"  [warn] Could not seed: {exc}")
+
+    live = _LiveDisplay(n_trials=n_trials, n_show=5)
+
+    study.optimize(
+        partial(
+            _objective_images,
+            images=images,
+            search_space=search_space,
+            tag_family=tag_family,
+            prune_eval_interval=prune_eval_interval,
+            max_tag_id=max_tag_id,
+            silence_ids=silence_ids,
+            synthetic_blur=synthetic_blur,
+        ),
+        n_trials=n_trials,
+        n_jobs=n_jobs,
+        show_progress_bar=False,
+        callbacks=[live],
+    )
+
+    best = study.best_trial
+    completed = [t for t in study.trials if t.value is not None]
+
+    print(f"\n{'='*60}\nOPTIMIZATION RESULTS\n{'='*60}")
+    print(f"Best score: {best.value:.4f}  (trial #{best.number})")
+    print("Best parameters:")
+    for k, v in sorted(best.params.items()):
+        print(f"  {k}: {v}")
+    print("Best metrics:")
+    for k, v in sorted(best.user_attrs.items()):
+        vstr = f"{v:.4f}" if isinstance(v, float) else str(v)
+        print(f"  {k}: {vstr}")
+
+    print(f"\nTop 5 of {len(completed)} completed trials:")
+    for i, t in enumerate(sorted(completed, key=lambda x: x.value, reverse=True)[:5]):
+        print(f"  #{i+1}  {_trial_line(t, best.number)}")
+
+    out_path = out_path_dir / f"best_params_{study_name}.json"
+    with open(out_path, "w") as f:
+        json.dump(
+            {"score": best.value, "params": best.params, "metrics": best.user_attrs},
+            f,
+            indent=2,
+        )
+    print(f"\nBest params saved to: {out_path}")
+
+    try:
+        csv_path = out_path_dir / f"trials_{study_name}.csv"
+        trials_df = study.trials_dataframe()
+        if "duration" in trials_df.columns:
+            trials_df["duration"] = trials_df["duration"].dt.total_seconds()
+            trials_df = trials_df.rename(columns={"duration": "duration_s"})
+        trials_df.to_csv(csv_path, index=False)
+        print(f"All trials saved to:  {csv_path}")
+    except Exception as exc:
+        print(f"[warn] Could not save trials CSV: {exc}")
+
+    _save_optuna_plots(study, out_path_dir / f"viz_{study_name}")
 
     return out_path

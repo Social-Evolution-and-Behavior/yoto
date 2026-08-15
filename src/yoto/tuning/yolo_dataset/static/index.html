@@ -11,10 +11,19 @@
     <ul id="frame-list"></ul>
     <h2>Thresholds</h2>
     <div id="sliders"></div>
+    <button id="reset-thr-btn" title="Reset the sliders to the bounds measured from the pkl">Reset to pkl bounds</button>
+    <label id="enhance-label" title="Re-detect this frame with the fast pipeline's sharpen/contrast pre-stages. Off = raw detector (what you get testing by hand).">
+      <input type="checkbox" id="enhance-chk" /> Enhance detection
+    </label>
+    <h2>Display</h2>
+    <label id="drop-opacity-label" title="Fade the blue (dropped) quads so the accepted ones stand out">
+      drop transparency <span id="drop-opacity-rd" class="rd"></span>
+      <input id="drop-opacity" type="range" min="0" max="1" step="0.05" value="0" />
+    </label>
     <h2>Export</h2>
-    <label><input type="checkbox" class="fmt" value="labelme" checked /> LabelMe</label>
+    <label><input type="checkbox" class="fmt" value="xanylabeling" checked /> X-AnyLabeling</label>
+    <label><input type="checkbox" class="fmt" value="yolo_axis" /> YOLO detect</label>
     <label><input type="checkbox" class="fmt" value="yolo_obb" /> YOLO OBB</label>
-    <label><input type="checkbox" class="fmt" value="yolo_axis" /> YOLO axis</label>
     <label title="Fraction of accepted frames held out as the YOLO validation set (the rest become the training set)">
       validation split
       <input id="val-frac" type="number" value="0.2" step="0.05" min="0" max="1" />

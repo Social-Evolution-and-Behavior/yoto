@@ -10,14 +10,42 @@ reliable trajectories.
 3. **Short-gap interpolation** — linear interpolation bridges gaps up to `interp_limit` frames.
 4. **Distance computation** — frame-to-frame Euclidean distances per tag.
 5. **Jump deletion** — consecutive detections farther than `max_jump_distance` px are removed as a block.
-6. **YOLO-fill** — if a `_yolo.pkl` sidecar exists, undecoded YOLO boxes are used to recover missing tag positions via a forward + backward chain matcher; each tag's anchor is snapped to the nearest undecoded box within `snap_threshold × snap_multiplier`. A collision-resolution loop then resolves boxes claimed by multiple tags. Sub-steps:
+6. **YOLO-fill** — if a `_yolo` sidecar exists, undecoded YOLO boxes are used to recover missing tag positions via a forward + backward chain matcher; each tag's anchor is snapped to the nearest undecoded box within `median_tag_side_px × tag_size_multiplier` — a search radius derived from the measured tag size in pixels, not from how far an ant moves. A collision-resolution loop then resolves boxes claimed by multiple tags. Sub-steps:
     - **6a** — initial chain fill.
-    - **6c** — prune ambiguous tracklets (boxes claimed by 2+ tags) and re-chain.
-    - **6d** — re-chain on the post-prune state, with cross-frame collision tracking so tags can't re-claim a box another tag already occupies.
-    - **6f** — extra `_delete_jump_blocks` pass to clean up any jumps the re-chain introduced.
-7. **Long-gap recovery** *(experimental, gated by `--recover-long-gaps`)* — for each tag with a NaN gap longer than `min_gap_recovery_frames`, run a chained velocity-aware walk from the bounding anchors that snaps each gap frame to the closest unclaimed YOLO box within the snap radius. Targets ants whose AprilTag was temporarily un-decodable but YOLO still saw the body.
+    - **6b** — prune ambiguous tracklets (boxes claimed by 2+ tags).
+    - **6c** — re-chain on the post-prune state, with cross-frame collision tracking so tags can't re-claim a box another tag already occupies.
+    - **6d** — recompute frame-to-frame distances on the re-chained data.
+    - **6e** — extra `_delete_jump_blocks` pass to clean up any jumps the re-chain introduced.
+7. **Long-gap recovery** *(experimental, gated by `--recover-long-gaps`)* — for each tag with a NaN gap longer than `min_gap_recovery_frames`, run a chained velocity-aware walk from the bounding anchors that snaps each gap frame to the closest unclaimed YOLO box within the same search radius. Targets ants whose AprilTag was temporarily un-decodable but YOLO still saw the tag.
 8. **Final jump pass** *(experimental, gated by `--final-jump-pass`)* — one more `_delete_jump_blocks` round on the fully-recovered YOLO-only data, before interpolation. Safety net for A/B comparisons.
-9. **Re-interpolation** — short gaps created by steps 6–8 are filled by linear interpolation and frame-to-frame distances are recomputed. Always runs last so all output distances are fresh.
+9. **Re-interpolation** — short gaps created by steps 6–8 are filled by linear interpolation and frame-to-frame distances are recomputed. Corner columns are excluded from interpolation and are then cleared on every non-`ORIGINAL` row. Always runs last so all output distances are fresh.
+
+## Output Format
+
+`clean` writes `<stem><dataname>_clean.pkl.zst` to `tracking/clean_data/` — a
+wide frame indexed by frame number, with a `(tag_id, metric)` column
+MultiIndex. Metrics are `center_x`, `center_y`, `ass_type`, `distance`, and
+the eight corner coordinates `c0x` … `c3y`.
+
+Pickles written by earlier yoto versions still load, and `clean` accepts them
+as input.
+
+Read corners with [`load_corners`](../api/io.md), which returns an
+`(n, 4, 2)` array:
+
+```python
+from yoto import load_data, load_corners
+
+df = load_data("/path/to/recordings/", dataname="myrun", video_nb=0)
+quads = load_corners(df, tag_id="42")     # (n_frames, 4, 2)
+```
+
+Corners are only present where `ass_type == ORIGINAL`. A quad is a
+measurement of where the tag physically was, so it is never interpolated,
+never carried over onto a YOLO-filled row, and is cleared along with the
+position when a jump block is deleted. Every other row's corners are `NaN`,
+which means `load_corners` returns fewer finite quads than there are
+positions — filter on `ass_type` (or on `np.isfinite`) before using them.
 
 ## Usage
 
@@ -37,7 +65,7 @@ yoto clean /path/to/experiment.mp4 \
 # YOLO-fill options (step 6)
 yoto clean /path/to/experiment.mp4 \
     --yolo-fill True \
-    --snap-multiplier 2.0 \
+    --tag-size-multiplier 2.0 \
     --max-consecutive-misses 10 \
     --yolo-fill-limit 0 \
     --rechain-affected-only False
@@ -59,14 +87,31 @@ yoto clean /path/to/experiment.mp4 --csv
 
 # Pickle per-step snapshots into <clean_dir>/<stem>_snapshots/ for notebook debugging
 yoto clean /path/to/experiment.mp4 --debug-snapshots True
+
+# Batch a tree, 3 videos at a time; or restrict to given 0-based indices
+yoto clean /path/to/recordings/ --parallel 3
+yoto clean /path/to/recordings/ --video-nb 0,2,5-9
 ```
 
 When a video file is passed, `yoto clean` finds the matching raw pickle in
 `<recording>/tracking/raw_data/` (using `--dataname` for the suffix, default
-`_apriltagDetect14`) and auto-discovers the `_yolo.pkl` sidecar in the same
+`_apriltagDetect14`) and auto-discovers the `_yolo` sidecar in the same
 directory.
 
 ### Python API
+
+`clean_video` mirrors `yoto clean` for one recording: it resolves the raw
+pickle (from a pickle path or a video path), discovers the `_yolo` sidecar,
+writes to `tracking/clean_data/`, and returns the cleaned frame.
+
+```python
+from yoto import clean_video
+
+cleaned = clean_video("/path/to/experiment.mp4")
+```
+
+For full control, call `clean_tracking_data` on a DataFrame you loaded
+yourself:
 
 ```python
 from yoto.cleaning import clean_tracking_data
@@ -82,7 +127,7 @@ cleaned, ids, metrics = clean_tracking_data(
     interpolation_limit=5,
     max_jump_distance=100.0,
     undecoded_df=undecoded_df,        # enables step 6 (YOLO-fill)
-    snap_multiplier=2.0,
+    tag_size_multiplier=2.0,
     max_consecutive_misses=10,
     yolo_fill_limit=0,                # 0 = uncapped; misses control chain death
     rechain_affected_only=False,
@@ -131,10 +176,11 @@ The `metrics` dict returned alongside the cleaned DataFrame contains:
 | `yolo_inferred_count` | Cells recovered by YOLO-fill (`ASS_TYPE_YOLO_INFERRED`) |
 | `yolo_inferred_pct_of_gaps` | YOLO-fill recoveries as % of all gaps |
 | `yolo_pruned_count` | YOLO_INFERRED cells dropped by collision resolution |
-| `yolo_rechained_count` | Cells re-filled by step 6d after pruning |
+| `yolo_rechained_count` | Cells re-filled by step 6c after pruning |
 | `long_gap_recovered_count` | Cells filled by step 7 long-gap recovery (0 unless enabled) |
 | `final_jump_deleted_count` | Cells removed by step 8 final-jump-pass (0 unless enabled) |
-| `snap_threshold_px` | Per-video snap radius computed from the good-track distance percentile |
+| `tag_size_px` | Median measured tag side length in pixels — the YOLO-fill search radius is this × `tag_size_multiplier` |
+| `max_move_px` | 99th-percentile frame-to-frame movement across all `ORIGINAL` detections. Informational only; not used as a threshold. |
 
 ## Assignment Types
 
@@ -159,7 +205,7 @@ mm-per-pixel conversion without re-running anything.
 ```python
 import pandas as pd
 
-df = pd.read_pickle("recording_clean.pkl")
+df = pd.read_pickle("recording_clean.pkl.zst")
 print(df.attrs["yoto_mm_per_px"])         # e.g. 0.00803
 print(df.attrs["yoto_yolo_filled_count"]) # e.g. 12_437
 mm = df[(42, "center_x")].diff().abs() * df.attrs["yoto_mm_per_px"]
@@ -190,19 +236,25 @@ single file.
 | `yoto_yolo_weights` | str | Path to the YOLO weights used for detection |
 | `yoto_preset` | str \| None | AprilTag preset (built-in name or JSON path), or `None` for defaults |
 | `yoto_pad_ratio` | float | Per-axis padding ratio applied around each YOLO box before AprilTag decoding |
+| `yoto_tag_family` | str | AprilTag family passed to the decoder |
+| `yoto_max_tag_id` | int | Cutoff above which decodes were discarded |
+| `yoto_silence_ids` | list[int] | Tag IDs dropped unconditionally (empty when unused) |
+| `yoto_no_enhance` | bool | Whether image enhancement was skipped |
+| `yoto_n_frames` | int | Frames processed by the detect run |
 
 ### YOLO-fill knobs and counts
 
 | Attribute | Type | Meaning |
 |-----------|------|---------|
-| `yoto_snap_threshold_px` | float | Per-frame snap radius computed from the good-track distance percentile |
-| `yoto_snap_multiplier` | float | Multiplier applied to `snap_threshold_px` to obtain the snap cap |
+| `yoto_tag_size_px` | float | Median measured tag side length in pixels |
+| `yoto_tag_size_multiplier` | float | Multiplier on `tag_size_px` giving the YOLO-fill search radius |
+| `yoto_max_move_px` | float | 99th-percentile frame-to-frame movement across `ORIGINAL` detections. Informational only. |
 | `yoto_yolo_fill_limit` | int | Hard cap on YOLO-fill gap length (0 = unlimited; chains die via `max_consecutive_misses`) |
 | `yoto_max_consecutive_misses` | int | Consecutive miss frames before a chain anchor is cleared |
-| `yoto_rechain_affected_only` | bool | Whether the step-6d re-chain restricted candidates to pruned tags |
+| `yoto_rechain_affected_only` | bool | Whether the step-6c re-chain restricted candidates to pruned tags |
 | `yoto_yolo_filled_count` | int | Cells filled by YOLO-fill (`ASS_TYPE_YOLO_INFERRED`) |
 | `yoto_yolo_pruned_count` | int | YOLO_INFERRED cells dropped by collision resolution / cross-track pruning |
-| `yoto_yolo_rechained_count` | int | Cells re-filled by step-6d after pruning |
+| `yoto_yolo_rechained_count` | int | Cells re-filled by step 6c after pruning |
 
 ### Long-gap recovery (experimental)
 
@@ -221,9 +273,9 @@ single file.
 
 ### Imaging scale
 
-Measured at the *start* of cleaning, from decoded AprilTag corners
-(`COL_CORNERS`) in the input pickle — before any tag filtering, so the
-sample is as broad as possible.  See
+Measured at the *start* of cleaning, from the decoded AprilTag corners in
+the input pickle — before any tag filtering, so the sample is as broad as
+possible.  See
 [`compute_pixel_scale`](../api/cleaning.md#yoto.cleaning.compute_pixel_scale)
 for the stratified sampling logic.
 

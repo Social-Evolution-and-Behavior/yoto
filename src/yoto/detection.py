@@ -41,7 +41,10 @@ from yoto.constants import (
     COL_BOX_Y2,
     COL_CENTER_X,
     COL_CENTER_Y,
-    COL_CORNERS,
+    CORNER_COLS,
+    CORNER_DTYPE,
+    PICKLE_EXT,
+    PICKLE_EXTS,
     COL_FRAME,
     DEFAULT_APRILTAG_THREADS,
     DEFAULT_BATCH_SIZE,
@@ -79,6 +82,7 @@ from yoto.constants import (
     default_max_tag_id_for_family,
 )
 from yoto.exceptions import ModelLoadError
+from yoto.io import corner_row
 from yoto.image_processing import (
     contrast_enhance_cv2,
     contrast_enhance_pil,
@@ -87,10 +91,6 @@ from yoto.image_processing import (
 )
 
 logger = logging.getLogger(__name__)
-
-IMAGE_EXTENSIONS: frozenset[str] = frozenset(
-    {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp"}
-)
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -563,7 +563,7 @@ def _reproject_tags(
                 "tag_id": tag_id,
                 COL_CENTER_X: abs_xs_list[i],
                 COL_CENTER_Y: abs_ys_list[i],
-                COL_CORNERS: all_corners[i],
+                **corner_row(all_corners[i]),
             }
         )
         decoded[crop_idx] = tag_id
@@ -612,7 +612,7 @@ def _filter_and_reproject_quads(
                 COL_FRAME: frame_idx,
                 COL_CENTER_X: float(abs_corners[:, 0].mean()),
                 COL_CENTER_Y: float(abs_corners[:, 1].mean()),
-                COL_CORNERS: abs_corners,
+                **corner_row(abs_corners),
             }
         )
     return rows
@@ -769,7 +769,7 @@ def _process_frame_full(
                 "tag_id": tag_id,
                 COL_CENTER_X: cx,
                 COL_CENTER_Y: cy,
-                COL_CORNERS: tag["lb-rb-rt-lt"].copy(),
+                **corner_row(tag["lb-rb-rt-lt"]),
             }
         )
     return detection_rows
@@ -793,9 +793,8 @@ def _draw_image_overlay(
         tag_id = row["tag_id"]
         cx = row.get(COL_CENTER_X)
         cy = row.get(COL_CENTER_Y)
-        corners = row.get(COL_CORNERS)
-        if corners is not None:
-            pts = np.asarray(corners).astype(int).reshape(-1, 1, 2)
+        if all(c in row for c in CORNER_COLS):
+            pts = np.array([row[c] for c in CORNER_COLS]).astype(int).reshape(-1, 1, 2)
             cv2.polylines(out, [pts], isClosed=True, color=(0, 200, 255), thickness=2)
         if cx is not None and cy is not None:
             ix, iy = int(cx), int(cy)
@@ -1434,6 +1433,20 @@ def _pynvdec_predict(
 # ---------------------------------------------------------------------------
 
 
+def _write_pickle(df: pd.DataFrame, path: str) -> None:
+    """Write *df* with corner columns narrowed to float32.
+
+    Rows are built from Python floats, so pandas infers float64 for the
+    corner columns.  float32 is already finer than AprilTag's sub-pixel
+    accuracy (~0.00024 px at a 4512 px coordinate) and halves their size.
+    Compression is inferred from *path*'s extension.
+    """
+    cast = {c: CORNER_DTYPE for c in CORNER_COLS if c in df.columns}
+    if cast:
+        df = df.astype(cast)
+    df.to_pickle(path)
+
+
 def _stamp_attrs(
     df: pd.DataFrame,
     video_path: str,
@@ -1465,21 +1478,22 @@ def _save_sidecar(
 ) -> None:
     """Write a per-frame long-format sidecar next to the main pickle.
 
-    Output path: ``<main_pkl_stem><suffix>.pkl``.  Indexed by frame
+    Output path: ``<main_pkl_stem><suffix>.pkl.zst``.  Indexed by frame
     (non-unique).  ``empty_columns`` defines the schema for the
     no-data case so downstream code can read the file unconditionally.
     """
-    out_path = (
-        main_pkl[:-4] + suffix + ".pkl"
-        if main_pkl.endswith(".pkl")
-        else main_pkl + suffix + ".pkl"
-    )
+    stem = main_pkl
+    for ext in PICKLE_EXTS:
+        if stem.endswith(ext):
+            stem = stem[: -len(ext)]
+            break
+    out_path = stem + suffix + PICKLE_EXT
     if rows:
         df = pd.DataFrame(rows).set_index(COL_FRAME)
     else:
         df = pd.DataFrame(columns=empty_columns).rename_axis(COL_FRAME)
     _stamp_attrs(df, video_path, pipeline=pipeline, extra={"yoto_kind": kind})
-    df.to_pickle(out_path)
+    _write_pickle(df, out_path)
 
 
 def _probe_frame_count(video_path: str, fallback: int = 18000) -> int:
@@ -1566,7 +1580,8 @@ def run_detection_simple(
     if num_frames is None:
         num_frames = _probe_frame_count(video_path)
 
-    # Resolve output path — default mirrors `yoto detect`: <recording>/tracking/raw_data/
+    # Resolve output path — default mirrors `yoto detect`:
+    # <recording>/tracking/raw_data/
     video_basename = os.path.basename(video_path).rsplit(".", 1)[0]
     if output_path is None:
         output_path = os.path.join(
@@ -1575,7 +1590,7 @@ def run_detection_simple(
             TRACKING_SUBDIRS["raw_data"],
         )
     os.makedirs(output_path, exist_ok=True)
-    out_pkl = os.path.join(output_path, video_basename + data_suffix + ".pkl")
+    out_pkl = os.path.join(output_path, video_basename + data_suffix + PICKLE_EXT)
 
     start_time = time.time()
 
@@ -1671,7 +1686,7 @@ def run_detection_simple(
         df = pd.DataFrame(results_tag).set_index(COL_FRAME)
     else:
         df = pd.DataFrame(
-            columns=["tag_id", COL_CENTER_X, COL_CENTER_Y, COL_CORNERS]
+            columns=["tag_id", COL_CENTER_X, COL_CENTER_Y, *CORNER_COLS]
         ).rename_axis(COL_FRAME)
     pipeline_label = "simple_noyolo" if no_yolo else "simple"
     extra: dict[str, Any] = {
@@ -1690,7 +1705,7 @@ def run_detection_simple(
             }
         )
     _stamp_attrs(df, video_path, pipeline=pipeline_label, extra=extra)
-    df.to_pickle(out_pkl)
+    _write_pickle(df, out_pkl)
     if not no_yolo:
         if save_quads:
             _save_sidecar(
@@ -1700,7 +1715,7 @@ def run_detection_simple(
                 "simple",
                 suffix="_quads",
                 kind="quads",
-                empty_columns=[COL_CENTER_X, COL_CENTER_Y, COL_CORNERS],
+                empty_columns=[COL_CENTER_X, COL_CENTER_Y, *CORNER_COLS],
             )
         if save_yolo:
             _save_sidecar(
@@ -1885,7 +1900,7 @@ def run_detection_images(
             df = pd.DataFrame(detection_rows).set_index(COL_FRAME)
         else:
             df = pd.DataFrame(
-                columns=["tag_id", COL_CENTER_X, COL_CENTER_Y, COL_CORNERS]
+                columns=["tag_id", COL_CENTER_X, COL_CENTER_Y, *CORNER_COLS]
             ).rename_axis(COL_FRAME)
         img_extra: dict[str, Any] = {
             "yoto_preset": preset,
@@ -1899,8 +1914,8 @@ def run_detection_images(
             img_extra["yoto_yolo_weights"] = yolo_weights
         _stamp_attrs(df, img_path, pipeline=pipeline_label, extra=img_extra)
 
-        pkl_path = os.path.join(data_dir, f"{stem}{data_suffix}.pkl")
-        df.to_pickle(pkl_path)
+        pkl_path = os.path.join(data_dir, f"{stem}{data_suffix}{PICKLE_EXT}")
+        _write_pickle(df, pkl_path)
         logger.info("Pickle: %s", pkl_path)
 
         dfs.append(df)
@@ -1991,7 +2006,8 @@ def run_detection_fast(
     if num_frames is None:
         num_frames = _probe_frame_count(video_path)
 
-    # Resolve output path — default mirrors `yoto detect`: <recording>/tracking/raw_data/
+    # Resolve output path — default mirrors `yoto detect`:
+    # <recording>/tracking/raw_data/
     video_basename = os.path.basename(video_path).rsplit(".", 1)[0]
     if output_path is None:
         output_path = os.path.join(
@@ -2000,7 +2016,7 @@ def run_detection_fast(
             TRACKING_SUBDIRS["raw_data"],
         )
     os.makedirs(output_path, exist_ok=True)
-    out_pkl = os.path.join(output_path, video_basename + data_suffix + ".pkl")
+    out_pkl = os.path.join(output_path, video_basename + data_suffix + PICKLE_EXT)
 
     start_time = time.time()
 
@@ -2179,7 +2195,7 @@ def run_detection_fast(
         df = pd.DataFrame(results_tag).set_index(COL_FRAME)
     else:
         df = pd.DataFrame(
-            columns=["tag_id", COL_CENTER_X, COL_CENTER_Y, COL_CORNERS]
+            columns=["tag_id", COL_CENTER_X, COL_CENTER_Y, *CORNER_COLS]
         ).rename_axis(COL_FRAME)
     _stamp_attrs(
         df,
@@ -2196,7 +2212,7 @@ def run_detection_fast(
             "yoto_n_frames": effective_frames,
         },
     )
-    df.to_pickle(out_pkl)
+    _write_pickle(df, out_pkl)
     if save_quads:
         _save_sidecar(
             quads_all,
@@ -2205,7 +2221,7 @@ def run_detection_fast(
             "fast",
             suffix="_quads",
             kind="quads",
-            empty_columns=[COL_CENTER_X, COL_CENTER_Y, COL_CORNERS],
+            empty_columns=[COL_CENTER_X, COL_CENTER_Y, *CORNER_COLS],
         )
     if save_yolo:
         _save_sidecar(

@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """Unified AprilTag composite preprocessing for preset optimisation.
 
 All parameters are driven by a ``params`` dict so Optuna can sample them
@@ -7,11 +5,12 @@ directly.  :func:`preprocess_composite` is the single entry-point used by the
 optimizer's objective function.
 """
 
+from __future__ import annotations
+
 from typing import Any
 
 import cv2
 import numpy as np
-
 
 # ---------------------------------------------------------------------------
 # Primitive helpers

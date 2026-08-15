@@ -235,6 +235,12 @@ IMAGE_EXTENSIONS: frozenset[str] = frozenset(
 #: Name of the per-recording output sub-directory created by yoto.
 TRACKING_DIR: str = "tracking"
 
+#: Shared base for every ``yoto train`` tool's output, inside :data:`TRACKING_DIR`.
+TRAINING_SUBDIR: str = "training"
+
+#: ``build-testset`` output directory, under :data:`TRAINING_SUBDIR`.
+TESTSET_SUBDIR: str = "apriltag_testset"
+
 #: Standard sub-directories created inside :data:`TRACKING_DIR`.
 TRACKING_SUBDIRS: dict[str, str] = {
     "raw_data": "raw_data",
@@ -298,13 +304,59 @@ TAG_COLOR_SEED: int = 42
 COL_FRAME: str = "frame"
 COL_CENTER_X: str = "center_x"
 COL_CENTER_Y: str = "center_y"
-COL_CORNERS: str = "corners"
 COL_BOX_X1: str = "box_x1"
 COL_BOX_Y1: str = "box_y1"
 COL_BOX_X2: str = "box_x2"
 COL_BOX_Y2: str = "box_y2"
 COL_ASS_TYPE: str = "ass_type"
 COL_DISTANCE: str = "distance"
+
+# ---------------------------------------------------------------------------
+# Tag corner storage
+# ---------------------------------------------------------------------------
+
+#: Legacy single-column name holding a (4, 2) array per cell.  Pickles written
+#: before the flat-column format used this; :func:`yoto.io.load_corners` still
+#: reads it, but nothing writes it any more.  See :data:`CORNER_COLS`.
+COL_CORNERS: str = "corners"
+
+#: Flat corner coordinate columns, in ``lb-rb-rt-lt`` order — the same corner
+#: ordering the AprilTag library returns.  Eight float32 columns replace the
+#: former object-dtype ``corners`` column: an object column boxes one small
+#: ndarray per detection, which costs roughly 2.6x the bytes of the
+#: coordinates themselves and dominates pickle read/write time.
+CORNER_COLS: tuple[str, ...] = (
+    "c0x",
+    "c0y",
+    "c1x",
+    "c1y",
+    "c2x",
+    "c2y",
+    "c3x",
+    "c3y",
+)
+
+#: dtype for stored corner coordinates.  float32 resolves a 4512 px coordinate
+#: to ~0.00024 px — far finer than AprilTag's sub-pixel accuracy — at half the
+#: size of float64.  float16 would only manage ~2 px and is unusable.
+CORNER_DTYPE: str = "float32"
+
+# ---------------------------------------------------------------------------
+# Pickle storage format
+# ---------------------------------------------------------------------------
+
+#: Compression passed to ``DataFrame.to_pickle`` for pipeline outputs.  pandas
+#: infers the same codec back from the file extension on read, so a compressed
+#: pickle stays readable with a plain ``pd.read_pickle(path)``.
+PICKLE_COMPRESSION: str = "zstd"
+
+#: Extension for newly written pickles.  Readers accept both this and a plain
+#: ``.pkl`` so pickles written before compression keep loading unchanged.
+PICKLE_EXT: str = ".pkl.zst"
+
+#: Every pickle extension readers must recognise, longest first so that
+#: suffix-stripping matches ``.pkl.zst`` before ``.pkl``.
+PICKLE_EXTS: tuple[str, ...] = (".pkl.zst", ".pkl")
 
 # ---------------------------------------------------------------------------
 # Assignment type codes (stored in the ``ass_type`` column)

@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """End-of-run visualisation for AprilTag preset optimisation.
 
 Produces one PNG per sampled composite showing:
@@ -11,6 +9,8 @@ One block of rows is rendered per param set so it's easy to compare
 seed params vs Optuna best side-by-side.
 """
 
+from __future__ import annotations
+
 import random
 from pathlib import Path
 from typing import Any
@@ -19,7 +19,6 @@ import cv2
 import numpy as np
 
 from .preprocess import preprocess_composite
-
 
 # ---------------------------------------------------------------------------
 # Drawing helpers
@@ -200,7 +199,6 @@ def _render_panel(
         enhanced, (W, composite_bgr.shape[0]), interpolation=cv2.INTER_AREA
     )
     gray_bgr = cv2.cvtColor(gray_native, cv2.COLOR_GRAY2BGR)
-    gray_bgr = _banner(W, "preprocessed") if False else gray_bgr  # label inline below
 
     sep = np.full((2, W, 3), 180, dtype=np.uint8)
     panel = np.vstack([_banner(W, stat), annotated, sep, gray_bgr])
@@ -293,7 +291,6 @@ def render_comparison(
             import apriltag
 
             enhanced = preprocess_composite(composite, preprocess_params)
-            upscale = float(preprocess_params.get("upscale", 1.0))
             det = apriltag.apriltag(
                 family=tag_family,
                 threads=1,

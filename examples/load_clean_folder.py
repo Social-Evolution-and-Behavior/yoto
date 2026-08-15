@@ -10,8 +10,10 @@ tag family, …).
 ``load_clean_folder`` finds every clean pickle in *folder* whose stem
 ends with ``_<dataname>`` (e.g. ``--dataname yoto_0.10.x`` →
 ``*_yoto_0.10.x_clean.pkl``), concatenates them vertically into one
-DataFrame with a row MultiIndex of ``(source_video, frame)``, and merges
-the per-pickle ``.attrs`` dictionaries:
+DataFrame with a row MultiIndex of ``(frame, source, video_frame)`` —
+``frame`` is a global monotonic counter across the whole folder,
+``source`` is the video stem, ``video_frame`` is the original per-video
+frame number — and merges the per-pickle ``.attrs`` dictionaries:
 
 * If every pickle has the same value for an attribute, it is preserved
   as a scalar.
@@ -127,7 +129,8 @@ def load_clean_folder(folder: str | os.PathLike[str], dataname: str) -> pd.DataF
     -------
     pandas.DataFrame
         All rows from every matching pickle, concatenated vertically with
-        a ``(source, frame)`` row MultiIndex.  Original ``(tag_id, metric)``
+        a ``(frame, source, video_frame)`` row MultiIndex.  Original
+        ``(tag_id, metric)``
         column MultiIndex is preserved.  Merged ``.attrs`` are attached
         to the returned DataFrame.
 

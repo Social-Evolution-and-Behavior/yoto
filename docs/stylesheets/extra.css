@@ -13,24 +13,17 @@
 }
 
 /* Enlarge the persistent header logo — Material caps it at 1.2rem,
-   which reads as tiny in the deep-orange banner.  The logo is pulled
-   out of the header's flex flow (position: absolute) so growing it
-   never inflates the banner height or pushes down onto the tab row
-   (Home / Installation / ...).  It is vertically centred on the
-   header and anchored to the far left. */
+   which reads as tiny in the deep-orange banner.  The logo stays in
+   the header's flex flow, so the banner simply grows to contain it:
+   an absolutely positioned logo overhangs the header and is then
+   painted over by the tab row (Home / Installation / ...) as soon as
+   the page scrolls.  Material measures the header height at runtime,
+   so the taller banner keeps the correct scroll and anchor offsets. */
 .md-header__button.md-logo {
-  position: relative;
-  width: 2.6rem;   /* reserve horizontal room; height stays the header's */
-  height: 2.4rem;
-  padding: 0;
-  overflow: visible;
+  padding: 0.2rem 0.4rem;
 }
 .md-header__button.md-logo img,
 .md-header__button.md-logo svg {
-  position: absolute;
-  top: 90%;
-  left: -200%;
-  transform: translateY(-50%);
-  height: 4rem;  /* bump this to taste; it no longer resizes the banner */
+  height: 2.4rem;  /* bump this to taste; the banner grows with it */
   width: auto;
 }

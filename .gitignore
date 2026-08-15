@@ -43,3 +43,8 @@ Thumbs.db
 .env
 *.key
 credentials.json
+
+# Local scratch — experiment outputs, drafts, and working notes that happen
+# to live in the repo root.
+runs/
+/*.txt

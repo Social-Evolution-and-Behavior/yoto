@@ -30,12 +30,12 @@ from yoto.constants import (
     COL_ASS_TYPE,
     COL_CENTER_X,
     COL_CENTER_Y,
-    COL_CORNERS,
     DEFAULT_TRAIL_LENGTH,
     DEFAULT_TRAIL_SKIP,
     TAG_COLOR_SEED,
 )
 from yoto.exceptions import EncoderError, VideoReadError
+from yoto.io import corner_tag_ids, load_corners
 
 logger = logging.getLogger(__name__)
 
@@ -524,13 +524,12 @@ def render_overlay_video(
     # output resolution at extraction time.
     quads_by_frame: dict[int, list[np.ndarray[Any, np.dtype[np.int32]]]] = {}
     if quads_data is not None and len(quads_data):
-        for fn, corners in zip(
-            quads_data.index.to_numpy(), quads_data["corners"].to_numpy()
-        ):
-            arr = np.asarray(corners, dtype=np.float32)
-            if do_resize:
-                arr = arr * scale
-            quads_by_frame.setdefault(int(fn), []).append(arr.astype(np.int32))
+        quads = load_corners(quads_data)
+        if do_resize:
+            quads = quads * scale
+        quads_i = quads.astype(np.int32)
+        for i, fn in enumerate(quads_data.index.to_numpy()):
+            quads_by_frame.setdefault(int(fn), []).append(quads_i[i])
 
     # Undecoded YOLO boxes: {frame_idx: [(x1, y1, x2, y2), ...]}
     undecoded_by_frame: dict[int, list[tuple[int, int, int, int]]] = {}
@@ -599,33 +598,25 @@ def render_overlay_video(
                     (int(x1), int(y1), int(x2), int(y2), color)
                 )
 
-        # AprilTag decoded quads for ORIGINAL detections (from the
-        # cleaned pickle's corners column).  Each cell holds a 4x2 ndarray.
-        if COL_CORNERS in frame_data.columns.get_level_values(1):
-            for tag_id in id_list:
-                if (tag_id, COL_CORNERS) not in frame_data.columns:
-                    continue
-                col = frame_data[(tag_id, COL_CORNERS)]
-                ass = (
-                    frame_data[(tag_id, COL_ASS_TYPE)]
-                    if (tag_id, COL_ASS_TYPE) in frame_data.columns
-                    else None
+        # AprilTag decoded quads for ORIGINAL detections, from the cleaned
+        # pickle's corner coordinates (either storage format).
+        corner_ids = set(corner_tag_ids(frame_data))
+        for tag_id in id_list:
+            if tag_id not in corner_ids:
+                continue
+            quads = load_corners(frame_data, tag_id)
+            frames_arr = frame_data.index.to_numpy()
+            keep = np.isfinite(quads).all(axis=(1, 2))
+            if (tag_id, COL_ASS_TYPE) in frame_data.columns:
+                ass = frame_data[(tag_id, COL_ASS_TYPE)].to_numpy()
+                keep &= ass == ASS_TYPE_ORIGINAL
+            if do_resize:
+                quads = quads * scale
+            quads_i = quads.astype(np.int32)
+            for i in np.flatnonzero(keep):
+                debug_quads_by_frame.setdefault(int(frames_arr[i]), []).append(
+                    quads_i[i]
                 )
-                for fn, corners in zip(col.index.to_numpy(), col.to_numpy()):
-                    if corners is None or (
-                        isinstance(corners, float) and np.isnan(corners)
-                    ):
-                        continue
-                    if ass is not None and ass.loc[fn] != ASS_TYPE_ORIGINAL:
-                        continue
-                    arr = np.asarray(corners, dtype=np.float32)
-                    if arr.shape != (4, 2):
-                        continue
-                    if do_resize:
-                        arr = arr * scale
-                    debug_quads_by_frame.setdefault(int(fn), []).append(
-                        arr.astype(np.int32)
-                    )
 
     thickness = np.array([1] * 5 + [1] * 5 + [2] * 10 + [3] * 30, dtype=np.int32)
 

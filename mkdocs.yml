@@ -51,12 +51,21 @@ nav:
       - Detection Pipeline: guides/detection.md
       - Data Cleaning: guides/cleaning.md
       - Video Overlay: guides/video.md
+      - Training and Tuning: guides/training.md
   - API Reference:
       - Detection: api/detection.md
       - Cleaning: api/cleaning.md
       - Video: api/video.md
+      - Data Loading: api/io.md
       - Image Processing: api/image_processing.md
+      - Tuning: api/tuning.md
       - Constants: api/constants.md
+
+# Design specs and implementation plans are working documents, not user
+# documentation, so keep them out of the built site wherever they live.
+exclude_docs: |
+  */specs/
+  */plans/
 
 extra_css:
   - stylesheets/extra.css

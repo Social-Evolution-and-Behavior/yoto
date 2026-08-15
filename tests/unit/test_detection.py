@@ -8,7 +8,7 @@ from unittest.mock import MagicMock
 import numpy as np
 import pytest
 
-from yoto.constants import COL_CENTER_X, COL_CENTER_Y, COL_CORNERS, COL_FRAME
+from yoto.constants import COL_CENTER_X, COL_CENTER_Y
 from yoto.detection import (
     _build_apriltag_params_fast,
     _build_apriltag_params_simple,

@@ -23,10 +23,14 @@ import pandas as pd
 from yoto.constants import (
     DEFAULT_WEIGHTS,
     IMAGE_EXTENSIONS,
+    PICKLE_EXT,
+    TESTSET_SUBDIR,
     TRACKING_DIR,
     TRACKING_SUBDIRS,
+    TRAINING_SUBDIR,
     VIDEO_EXTENSIONS,
 )
+from yoto.io import find_pickle, is_pickle, strip_pickle_ext
 
 
 def _tracking_layout(recording_dir: str) -> dict[str, str]:
@@ -270,19 +274,16 @@ def _resolve_pickle_paths(path: str, data_suffix: str = "") -> list[str]:
     """
 
     def _is_raw(f: str) -> bool:
-        # Exclude sidecars: <stem>_quads.pkl and <stem>_yolo.pkl are
+        # Exclude sidecars: <stem>_quads and <stem>_yolo pickles are
         # produced by `yoto detect` and are not cleanable input.
         # When data_suffix is set, also drop pickles from other detect
         # runs in the same dir (e.g. `_8nNewSet_IR` alongside `_yoto_0.10.x`).
-        if (
-            f.startswith(".")
-            or not f.endswith(".pkl")
-            or f.endswith("_clean.pkl")
-            or f.endswith("_quads.pkl")
-            or f.endswith("_yolo.pkl")
-        ):
+        if f.startswith(".") or not is_pickle(f):
             return False
-        if data_suffix and not f[: -len(".pkl")].endswith(data_suffix):
+        stem = strip_pickle_ext(f)
+        if stem.endswith(("_clean", "_quads", "_yolo")):
+            return False
+        if data_suffix and not stem.endswith(data_suffix):
             return False
         return True
 
@@ -332,9 +333,13 @@ def _find_pickle_for_video(
 
     Default preference order:
 
-    1. ``<recording>/tracking/clean_data/<stem><data_suffix>_clean.pkl``
-    2. ``<recording>/tracking/raw_data/<stem><data_suffix>.pkl``
-    3. legacy path next to the video: ``<recording>/<stem><data_suffix>.pkl``
+    1. ``<recording>/tracking/clean_data/<stem><data_suffix>_clean``
+    2. ``<recording>/tracking/raw_data/<stem><data_suffix>``
+    3. legacy path next to the video: ``<recording>/<stem><data_suffix>``
+
+    Each candidate is tried with every extension in
+    :data:`~yoto.constants.PICKLE_EXTS`, compressed first, so recordings
+    processed before compression keep resolving.
 
     When *raw_only* is True the clean_data candidate is skipped so the
     caller gets the un-interpolated raw detections.
@@ -345,17 +350,18 @@ def _find_pickle_for_video(
     stem = os.path.splitext(os.path.basename(video_path))[0]
     layout = _tracking_layout(recording)
     candidates = [
-        os.path.join(layout["raw_data"], f"{stem}{data_suffix}.pkl"),
-        os.path.join(recording, f"{stem}{data_suffix}.pkl"),
+        os.path.join(layout["raw_data"], f"{stem}{data_suffix}"),
+        os.path.join(recording, f"{stem}{data_suffix}"),
     ]
     if not raw_only:
         candidates.insert(
             0,
-            os.path.join(layout["clean_data"], f"{stem}{data_suffix}_clean.pkl"),
+            os.path.join(layout["clean_data"], f"{stem}{data_suffix}_clean"),
         )
     for c in candidates:
-        if os.path.isfile(c):
-            return c
+        found = find_pickle(c)
+        if found is not None:
+            return found
     return None
 
 
@@ -707,7 +713,11 @@ def _build_worker_cmd(
     vpath: str,
     args: argparse.Namespace,
 ) -> list[str]:
-    """Build a ``yoto detect`` command for a single video (used by GNU parallel)."""
+    """Build the ``yoto detect`` command GNU parallel runs for one video.
+
+    *vpath* is the video path, or ``"{}"`` when building the template that
+    GNU parallel expands once per video.
+    """
     cmd = [sys.executable, "-m", "yoto.cli", "detect", vpath]
     if args.output_dir:
         cmd.append(args.output_dir)
@@ -737,6 +747,10 @@ def _build_worker_cmd(
         cmd.extend(["--silence-ids", ",".join(str(i) for i in silence)])
     cmd.extend(["--save-yolo", str(args.save_yolo)])
     cmd.extend(["--save-quads", str(args.save_quads)])
+    if getattr(args, "no_yolo", False):
+        cmd.append("--no-yolo")
+    if getattr(args, "no_enhance", False):
+        cmd.append("--no-enhance")
     return cmd
 
 
@@ -1173,35 +1187,8 @@ def _run_detect(args: argparse.Namespace) -> None:
     runtimes: dict[str, float] = {}
     wall_time: float = 0.0
     if use_parallel:
-        worker_tmpl = [sys.executable, "-m", "yoto.cli", "detect", "{}"]
-        if args.output_dir:
-            worker_tmpl.append(args.output_dir)
-        worker_tmpl.extend(["--yoloweights", args.yoloweights])
-        worker_tmpl.extend(["--dataname", args.dataname])
-        worker_tmpl.extend(["--use-nvdec", str(args.use_nvdec)])
-        if args.debug:
-            worker_tmpl.append("--debug")
-        if args.apriltag_preset:
-            worker_tmpl.extend(["--apriltag-preset", args.apriltag_preset])
-        worker_tmpl.extend(["--conf", str(args.conf)])
-        worker_tmpl.extend(["--iou", str(args.iou)])
-        worker_tmpl.extend(["--pad-ratio", str(args.pad_ratio)])
-        worker_tmpl.extend(["--max-tag-offset-ratio", str(args.max_tag_offset_ratio)])
-        worker_tmpl.extend(["--tag-family", args.tag_family])
-        worker_tmpl.extend(["--batch-size", str(args.batch_size)])
-        if args.max_tag_id is not None:
-            worker_tmpl.extend(["--max-tag-id", str(args.max_tag_id)])
-        worker_silence = _parse_id_list(args.silence_ids, "--silence-ids")
-        if worker_silence:
-            worker_tmpl.extend(
-                ["--silence-ids", ",".join(str(i) for i in worker_silence)]
-            )
-        worker_tmpl.extend(["--save-yolo", str(args.save_yolo)])
-        worker_tmpl.extend(["--save-quads", str(args.save_quads)])
-        if args.no_yolo:
-            worker_tmpl.append("--no-yolo")
-        if args.no_enhance:
-            worker_tmpl.append("--no-enhance")
+        # "{}" is GNU parallel's per-video placeholder.
+        worker_tmpl = _build_worker_cmd("{}", args)
         input_root = (
             args.video
             if os.path.isdir(args.video)
@@ -1379,7 +1366,8 @@ def _add_clean_parser(subparsers: argparse._SubParsersAction) -> None:
         metavar="FLOAT",
         help=f"Multiplier on the median tag side (px) that sets the maximum "
         f"distance a YOLO box can be from a tag's anchor to be accepted "
-        f"(default: {DEFAULT_TAG_SIZE_MULTIPLIER}). Constant cap — does NOT grow with gap length.",
+        f"(default: {DEFAULT_TAG_SIZE_MULTIPLIER}). Constant cap — does NOT "
+        "grow with gap length.",
     )
     p.add_argument(
         "--max-consecutive-misses",
@@ -1404,8 +1392,8 @@ def _add_clean_parser(subparsers: argparse._SubParsersAction) -> None:
         type=_str_to_bool,
         default=_RECHAIN_AFFECTED_ONLY_DEFAULT,
         metavar="BOOL",
-        help=f"In the re-chain pass (step 6d), restrict candidate tags "
-        f"to only those whose YOLO fills were pruned in step 6c "
+        help=f"In the re-chain pass (step 6c), restrict candidate tags "
+        f"to only those whose YOLO fills were pruned in step 6b "
         f"(default: {_RECHAIN_AFFECTED_ONLY_DEFAULT}). False (default) "
         f"lets every tag compete for the freed YOLO boxes.",
     )
@@ -1417,7 +1405,7 @@ def _add_clean_parser(subparsers: argparse._SubParsersAction) -> None:
         help=f"Experimental.  After step 7, for each tag with a NaN gap "
         f"longer than --min-gap-recovery-frames, match each gap frame to "
         f"the closest unclaimed YOLO box within median_tag_side * "
-        f"--reach-multiplier of the gap's leading or trailing anchor "
+        f"--tag-size-multiplier of the gap's leading or trailing anchor "
         f"(anchors are fixed — they don't drift) "
         f"(default: {_RECOVER_LONG_GAPS_DEFAULT}).",
     )
@@ -1446,7 +1434,7 @@ def _add_clean_parser(subparsers: argparse._SubParsersAction) -> None:
         metavar="BOOL",
         help="Debug.  Pickle the frame_data at each major cleaning "
         "checkpoint to "
-        "<clean_dir>/<stem>_snapshots/step{6a,6c,6d,6f,7,8}_*.pkl. "
+        "<clean_dir>/<stem>_snapshots/step{6a,6b,6c,6e,7,8}_*.pkl. "
         "Inspect them in a notebook to see exactly what each step "
         "did.  Off by default.",
     )
@@ -1558,16 +1546,16 @@ def _clean_one_pickle(
         # Write the raw CSV *before* clean_tracking_data, which mutates the
         # input frame in place.
         if write_csv:
-            raw_csv = os.path.splitext(pkl_path)[0] + ".csv"
+            raw_csv = strip_pickle_ext(pkl_path) + ".csv"
             _write_csv(frame_data, raw_csv)
 
         # Auto-discover the YOLO-fill source next to the raw pickle.
         # The _yolo.pkl sidecar is the single source of YOLO boxes; we
         # filter to the undecoded subset (decoded==False) for the fill.
         undecoded_df = None
-        if yolo_fill and pkl_path.endswith(".pkl"):
-            yolo_path = pkl_path[:-4] + "_yolo.pkl"
-            if os.path.isfile(yolo_path):
+        if yolo_fill and is_pickle(pkl_path):
+            yolo_path = find_pickle(strip_pickle_ext(pkl_path) + "_yolo")
+            if yolo_path is not None:
                 yolo_df = pd.read_pickle(yolo_path)
                 undecoded_df = yolo_df[~yolo_df["decoded"].astype(bool)].copy()
                 print(
@@ -1584,12 +1572,12 @@ def _clean_one_pickle(
                 "clean_data"
             ]
             os.makedirs(clean_dir, exist_ok=True)
-            stem = os.path.splitext(os.path.basename(pkl_path))[0]
-            output_path = os.path.join(clean_dir, f"{stem}_clean.pkl")
+            stem = strip_pickle_ext(os.path.basename(pkl_path))
+            output_path = os.path.join(clean_dir, f"{stem}_clean{PICKLE_EXT}")
 
         debug_snapshot_dir: str | None = None
         if debug_snapshots:
-            stem = os.path.splitext(os.path.basename(output_path))[0]
+            stem = strip_pickle_ext(os.path.basename(output_path))
             debug_snapshot_dir = os.path.join(
                 os.path.dirname(output_path), f"{stem}_snapshots"
             )
@@ -1623,7 +1611,7 @@ def _clean_one_pickle(
                 f"(median tag side {_side_px:.2f} px, n={_n_scale})"
             )
         if write_csv:
-            clean_csv = os.path.splitext(output_path)[0] + ".csv"
+            clean_csv = strip_pickle_ext(output_path) + ".csv"
             _write_csv(cleaned, clean_csv)
             print(f"  CSV:   {raw_csv}")
             print(f"  CSV:   {clean_csv}")
@@ -2021,7 +2009,10 @@ def _render_single_video(
         short_tag = "_short" if short else ""
         debug_tag = "_debug" if debug else ""
         if scale != 1.0:
-            out_name = f"{stem}{data_suffix}{raw_tag}{short_tag}{debug_tag}_scaled{scale:.2f}.mp4"
+            out_name = (
+                f"{stem}{data_suffix}{raw_tag}{short_tag}{debug_tag}"
+                f"_scaled{scale:.2f}.mp4"
+            )
         else:
             out_name = f"{stem}{data_suffix}{raw_tag}{short_tag}{debug_tag}.mp4"
         output_path = os.path.join(video_out_dir, out_name)
@@ -2301,7 +2292,8 @@ def _add_build_testset_parser(subparsers: argparse._SubParsersAction) -> None:
     p.add_argument(
         "--out-dir",
         default=None,
-        help="Root testset directory (default: <first_video_parent>/apriltag_testset)",
+        help="Root testset directory (default: <recording>/tracking/training/"
+        "apriltag_testset, or the legacy tracking/apriltag_testset if it exists)",
     )
     p.add_argument(
         "--gt-source",
@@ -2329,13 +2321,19 @@ def _add_build_testset_parser(subparsers: argparse._SubParsersAction) -> None:
         "--min-detection-frac",
         type=float,
         default=0.8,
-        help="Minimum fraction of known tags visible for a frame to enter the pool (default: 0.8)",
+        help=(
+            "Minimum fraction of known tags visible for a frame to enter "
+            "the pool (default: 0.8)"
+        ),
     )
     p.add_argument(
         "--pad-ratio",
         type=float,
         default=DEFAULT_PAD_RATIO,
-        help=f"Per-axis crop padding — must match yoto detect (default: {DEFAULT_PAD_RATIO})",
+        help=(
+            "Per-axis crop padding — must match yoto detect "
+            f"(default: {DEFAULT_PAD_RATIO})"
+        ),
     )
     p.add_argument(
         "--conf-thresh",
@@ -2418,11 +2416,26 @@ def _run_build_testset(args: argparse.Namespace) -> None:
         for v in videos:
             stem = Path(v).with_suffix("").name
             layout = _tracking_layout(_recording_dir_for_video(v))
-            clean = Path(layout["clean_data"]) / f"{stem}{dataname}_clean.pkl"
-            sidecar = Path(layout["raw_data"]) / f"{stem}{dataname}_yolo.pkl"
+            clean_found = find_pickle(
+                str(Path(layout["clean_data"]) / f"{stem}{dataname}_clean")
+            )
+            sidecar_found = find_pickle(
+                str(Path(layout["raw_data"]) / f"{stem}{dataname}_yolo")
+            )
+            # Fall back to the compressed name purely for error messages.
+            clean = (
+                Path(clean_found)
+                if clean_found
+                else Path(layout["clean_data"]) / f"{stem}{dataname}_clean{PICKLE_EXT}"
+            )
+            sidecar = (
+                Path(sidecar_found)
+                if sidecar_found
+                else Path(layout["raw_data"]) / f"{stem}{dataname}_yolo{PICKLE_EXT}"
+            )
 
             if args.gt_source == "clean":
-                if not clean.exists():
+                if clean_found is None:
                     raise SystemExit(
                         f"Cannot find clean pickle for {v}: tried {clean} "
                         f"(check --dataname, currently {dataname!r})"
@@ -2430,7 +2443,7 @@ def _run_build_testset(args: argparse.Namespace) -> None:
                 pickles.append(str(clean))
                 gt_modes.append("clean")
             elif args.gt_source == "yolo":
-                if not sidecar.exists():
+                if sidecar_found is None:
                     raise SystemExit(
                         f"Cannot find YOLO sidecar for {v}: tried {sidecar} "
                         f"(run 'yoto detect' first; check --dataname, "
@@ -2439,10 +2452,10 @@ def _run_build_testset(args: argparse.Namespace) -> None:
                 pickles.append(str(sidecar))
                 gt_modes.append("yolo")
             else:  # auto: clean pickle if present, else YOLO sidecar
-                if clean.exists():
+                if clean_found is not None:
                     pickles.append(str(clean))
                     gt_modes.append("clean")
-                elif sidecar.exists():
+                elif sidecar_found is not None:
                     pickles.append(str(sidecar))
                     gt_modes.append("yolo")
                 else:
@@ -2456,9 +2469,8 @@ def _run_build_testset(args: argparse.Namespace) -> None:
     if "yolo" in gt_modes:
         n_yolo = gt_modes.count("yolo")
         print(
-            "\n"
-            + "!" * 64
-            + f"\n!!  YOLO MODE for {n_yolo}/{len(gt_modes)} video(s): building testset from\n"
+            "\n" + "!" * 64 + f"\n!!  YOLO MODE for {n_yolo}/{len(gt_modes)} video(s): "
+            "building testset from\n"
             "!!  YOLO boxes with NO GROUND TRUTH (nothing has decoded yet).\n"
             "!!  optimize-preset will target raw decode YIELD, not accuracy.\n"
             + "!" * 64
@@ -2482,9 +2494,7 @@ def _run_build_testset(args: argparse.Namespace) -> None:
     if args.parallel is not None and args.parallel < 1:
         raise SystemExit("Error: --parallel must be >= 1")
 
-    out_dir = args.out_dir or str(
-        Path(videos[0]).parent / "tracking" / "apriltag_testset"
-    )
+    out_dir = args.out_dir or _default_testset_dir(str(Path(videos[0]).parent))
 
     use_parallel = args.parallel is not None and args.parallel > 1 and len(videos) > 1
     if use_parallel and args.pickles is not None:
@@ -2596,17 +2606,34 @@ def _run_build_testset(args: argparse.Namespace) -> None:
     print(f"Total crops:          {total_crops}")
 
 
+def _default_testset_dir(recording_dir: str) -> str:
+    """Default testset directory for a recording, under ``tracking/training/``.
+
+    All ``yoto train`` tools share the ``tracking/training/`` base.  Testsets
+    built before that move live at the legacy ``tracking/apriltag_testset``;
+    when such a directory already exists it keeps being used, so an existing
+    testset is never split across two locations.
+    """
+    base = os.path.join(recording_dir, TRACKING_DIR)
+    legacy = os.path.join(base, TESTSET_SUBDIR)
+    if os.path.isdir(legacy):
+        return legacy
+    return os.path.join(base, TRAINING_SUBDIR, TESTSET_SUBDIR)
+
+
 def _resolve_testset_dir(path: str | None) -> str:
     """Resolve *path* to a testset directory (``*/manifest.json`` inside).
 
     *path* may be the testset dir itself, a recording folder (uses its
-    ``tracking/apriltag_testset``), or ``None`` (the current directory).
-    Returns the best candidate; the caller checks it actually has manifests.
+    ``tracking/training/apriltag_testset``, or the legacy
+    ``tracking/apriltag_testset`` when that is what exists), or ``None``
+    (the current directory).  Returns the best candidate; the caller checks
+    it actually has manifests.
     """
     base = path or "."
     if glob.glob(os.path.join(base, "*", "manifest.json")):
         return base
-    return os.path.join(base, TRACKING_DIR, "apriltag_testset")
+    return _default_testset_dir(base)
 
 
 def _add_subsample_testset_parser(subparsers: argparse._SubParsersAction) -> None:
@@ -2621,7 +2648,7 @@ def _add_subsample_testset_parser(subparsers: argparse._SubParsersAction) -> Non
         "recording",
         nargs="?",
         default=None,
-        help="Recording folder (uses its tracking/apriltag_testset) or a "
+        help="Recording folder (uses its tracking/training/apriltag_testset) or a "
         "testset directory directly. Defaults to the current directory.",
     )
     p.add_argument(
@@ -2881,14 +2908,17 @@ def _add_optimize_preset_parser(subparsers: argparse._SubParsersAction) -> None:
     p = subparsers.add_parser(
         "optimize-preset",
         help=(
-            "Run Optuna to find the best AprilTag preprocessing preset "
-            "for a testset built with build-testset"
+            "Run Optuna to find the best AprilTag preprocessing preset. "
+            "Accepts a testset built with build-testset, OR a single image / "
+            "folder of images (manifest-free, maximises distinct decodes)"
         ),
     )
     p.add_argument(
         "--testset-dir",
         required=True,
-        help="Testset directory built by build-testset",
+        help="Testset directory built by build-testset, OR an image file / "
+        "folder of images (no manifests) to optimise a preset directly on "
+        "those images with no ground truth",
     )
     p.add_argument(
         "--out-dir",
@@ -2933,7 +2963,10 @@ def _add_optimize_preset_parser(subparsers: argparse._SubParsersAction) -> None:
     p.add_argument(
         "--study-name",
         default="yoto_preset",
-        help="Optuna study name, also used in the output filename (default: yoto_preset)",
+        help=(
+            "Optuna study name, also used in the output filename "
+            "(default: yoto_preset)"
+        ),
     )
     p.add_argument(
         "--storage",
@@ -2994,13 +3027,19 @@ def _add_optimize_preset_parser(subparsers: argparse._SubParsersAction) -> None:
     p.add_argument(
         "--synthetic-blur",
         action="store_true",
-        help="Apply disk-kernel blur before preprocessing (brightfield-style augmentation)",
+        help=(
+            "Apply disk-kernel blur before preprocessing "
+            "(brightfield-style augmentation)"
+        ),
     )
     p.add_argument(
         "--max-tag-id",
         type=int,
         default=9999,
-        help="Drop decoded IDs above this value (e.g. 512 for tagBCH64). Default: 9999 (no cap)",
+        help=(
+            "Drop decoded IDs above this value (e.g. 512 for tagBCH64). "
+            "Default: 9999 (no cap)"
+        ),
     )
     p.add_argument(
         "--silence-ids",
@@ -3053,7 +3092,6 @@ def _run_optimize_preset_parallel(
 ) -> None:
     """Spawn n_jobs-1 background workers + run the main worker in-process."""
     import subprocess
-    import time
 
     from yoto.tuning import optimize_preset
 
@@ -3245,6 +3283,40 @@ def _export_preset_from_trial(args: argparse.Namespace) -> None:
 def _run_optimize_preset(args: argparse.Namespace) -> None:
     from yoto.tuning import optimize_preset
 
+    # Raw-image input (single image or a folder of images, not a testset
+    # dir — whose top level holds only per-video sub-folders): route to the
+    # manifest-free image optimizer, which maximises the number of distinct
+    # tags decoded (no ground truth needed).  Checked before the
+    # file-as-subset-manifest handling below so an image file isn't mistaken
+    # for a subset manifest.  Reuses the detect-stage _is_image_input helper.
+    if args.export_trial is None and _is_image_input(args.testset_dir):
+        from yoto.tuning.optimize import optimize_preset_images
+
+        silence_ids: frozenset[int] = frozenset()
+        if args.silence_ids:
+            silence_ids = frozenset(
+                int(x) for x in args.silence_ids.replace(",", " ").split()
+            )
+        print("  [info] Input is image(s); running manifest-free image optimizer.")
+        optimize_preset_images(
+            args.testset_dir,
+            out_dir=args.out_dir,
+            search_space=args.search_space,
+            n_trials=args.n_trials,
+            n_jobs=args.n_jobs,
+            tag_family=args.tag_family,
+            study_name=args.study_name,
+            storage=args.storage,
+            seed_params=args.seed_params,
+            pruner_startup_trials=args.pruner_startup_trials,
+            pruner_warmup_steps=args.pruner_warmup_steps,
+            prune_eval_interval=args.prune_eval_interval,
+            max_tag_id=args.max_tag_id,
+            silence_ids=silence_ids,
+            synthetic_blur=args.synthetic_blur,
+        )
+        return
+
     # Allow --testset-dir to point directly at a subset manifest file
     # (e.g. subset_manifest.json): treat it as --subset-manifest and use its
     # parent as the testset dir.
@@ -3261,7 +3333,7 @@ def _run_optimize_preset(args: argparse.Namespace) -> None:
         _export_preset_from_trial(args)
         return
 
-    silence_ids: frozenset[int] = frozenset()
+    silence_ids = frozenset()
     if args.silence_ids:
         silence_ids = frozenset(
             int(x) for x in args.silence_ids.replace(",", " ").split()
@@ -3312,6 +3384,142 @@ def _run_optimize_preset(args: argparse.Namespace) -> None:
     )
 
 
+def _add_build_crop_dataset_parser(subparsers: argparse._SubParsersAction) -> None:
+    from yoto.tuning.crop_dataset import DEFAULT_COPY_JOBS
+
+    p = subparsers.add_parser(
+        "build-crop-dataset",
+        help=(
+            "Organise the crops written by build-testset into an ImageFolder "
+            "classification dataset (per-tag backup ID model)"
+        ),
+    )
+    p.add_argument(
+        "recording",
+        nargs="?",
+        default=None,
+        help="Recording folder (uses its tracking/training/apriltag_testset) or "
+        "a testset directory directly. Defaults to the current directory.",
+    )
+    p.add_argument(
+        "--testset-dir",
+        default=None,
+        help="Explicit testset directory (overrides the positional lookup)",
+    )
+    p.add_argument(
+        "--out-dir",
+        default=None,
+        help="Dataset root (default: <recording>/tracking/training/crop_dataset)",
+    )
+    p.add_argument(
+        "--val-frac",
+        type=float,
+        default=0.2,
+        help="Fraction of experiments held out for validation (default: 0.2)",
+    )
+    p.add_argument(
+        "--ass-types",
+        choices=["all", "original"],
+        default="all",
+        help="Provenance allowed in train: 'all' includes the undecoded "
+        "(YOLO-inferred) crops this model exists to recover (default: all)",
+    )
+    p.add_argument(
+        "--val-ass-types",
+        choices=["all", "original"],
+        default="original",
+        help="Provenance allowed in val. Default 'original' keeps the metric "
+        "honest — inferred labels partly score the chaining heuristic",
+    )
+    p.add_argument(
+        "--min-count",
+        type=int,
+        default=100,
+        help="Drop tag IDs with fewer usable crops (default: 100)",
+    )
+    p.add_argument(
+        "--max-per-class",
+        type=int,
+        default=None,
+        help="Optional per-split cap, applied by even stride over time",
+    )
+    p.add_argument(
+        "--symlink",
+        type=_str_to_bool,
+        default=False,
+        help="Symlink instead of copying (default: False)",
+    )
+    p.add_argument(
+        "--force",
+        type=_str_to_bool,
+        default=False,
+        help="Rebuild over an existing dataset directory (default: False)",
+    )
+    p.add_argument(
+        "--jobs",
+        type=int,
+        default=DEFAULT_COPY_JOBS,
+        help="Parallel file copies. Crops live on NFS where each copy is a few "
+        "round-trips on ~2 KB, so this is latency-bound "
+        f"(default: {DEFAULT_COPY_JOBS}; 1 = serial)",
+    )
+    p.set_defaults(func=_run_build_crop_dataset)
+
+
+def _run_build_crop_dataset(args: argparse.Namespace) -> None:
+    from yoto.tuning import crop_dataset
+
+    testset_dir = args.testset_dir or _resolve_testset_dir(args.recording)
+    if not glob.glob(os.path.join(testset_dir, "*", "manifest.json")):
+        raise SystemExit(
+            f"No testset manifests found under {testset_dir}/*/manifest.json. "
+            "Run 'yoto train build-testset' first, or pass --testset-dir."
+        )
+
+    if args.out_dir:
+        out_dir = args.out_dir
+    else:
+        # The testset lives at <recording>/tracking[/training]/apriltag_testset;
+        # put the dataset beside the other training outputs either way.
+        base = os.path.dirname(os.path.abspath(testset_dir))
+        if os.path.basename(base) != TRAINING_SUBDIR:
+            base = os.path.join(base, TRAINING_SUBDIR)
+        out_dir = os.path.join(base, "crop_dataset")
+
+    try:
+        doc = crop_dataset.build_crop_dataset(
+            testset_dir,
+            out_dir,
+            val_frac=args.val_frac,
+            ass_types=args.ass_types,
+            val_ass_types=args.val_ass_types,
+            min_count=args.min_count,
+            max_per_class=args.max_per_class,
+            symlink=args.symlink,
+            force=args.force,
+            jobs=args.jobs,
+        )
+    except FileExistsError as exc:
+        raise SystemExit(f"Error: {exc}") from None
+    except ValueError as exc:
+        raise SystemExit(f"Error: {exc}") from None
+
+    n_tr, n_va = doc["n_crops"]["train"], doc["n_crops"]["val"]
+    print(f"Crop dataset written to {out_dir}")
+    print(f"  Classes:  {doc['n_classes']}")
+    print(
+        f"  Train:    {n_tr} crops over {len(doc['train_experiments'])} experiment(s)"
+    )
+    print(f"  Val:      {n_va} crops over {len(doc['val_experiments'])} experiment(s)")
+    print(
+        f"  Train provenance (1=ORIGINAL 2=INTERP 3=YOLO): {doc['provenance']['train']}"
+    )
+    if doc["dropped_classes"]:
+        print(f"  Dropped {len(doc['dropped_classes'])} class(es) below --min-count")
+    if doc["skipped_experiments"]:
+        print(f"  Skipped (no/bad manifest): {doc['skipped_experiments']}")
+
+
 def _add_build_yolo_dataset_parser(subparsers: argparse._SubParsersAction) -> None:
     from yoto.constants import DEFAULT_TAG_FAMILY
 
@@ -3358,16 +3566,56 @@ def _add_build_yolo_dataset_parser(subparsers: argparse._SubParsersAction) -> No
         help="Output/cache directory "
         "(default: <recording>/tracking/training/yolo_dataset)",
     )
-    p.add_argument("--total-frames", type=int, default=40)
-    p.add_argument("--best-fraction", type=float, default=1.0 / 3.0)
     p.add_argument(
-        "--frame-select", choices=["auto", "best-worst", "stride"], default="auto"
+        "--total-frames",
+        type=int,
+        default=40,
+        help="Frames to precompute and review per experiment (default: 40)",
     )
-    p.add_argument("--family", default=DEFAULT_TAG_FAMILY)
-    p.add_argument("--host", default="127.0.0.1")
-    p.add_argument("--port", type=int, default=8000)
-    p.add_argument("--open", type=_str_to_bool, default=True)
-    p.add_argument("--precompute-only", type=_str_to_bool, default=False)
+    p.add_argument(
+        "--best-fraction",
+        type=float,
+        default=1.0 / 3.0,
+        help=(
+            "Share of --total-frames taken from the best-decoding frames; the "
+            "rest come from the worst, so the set spans both (default: 1/3)"
+        ),
+    )
+    p.add_argument(
+        "--frame-select",
+        choices=["auto", "best-worst", "stride"],
+        default="auto",
+        help=(
+            "How to pick frames: 'best-worst' ranks them by decode count from "
+            "the pkl, 'stride' spaces them evenly, 'auto' (default) uses "
+            "best-worst when a pkl is available and stride otherwise"
+        ),
+    )
+    p.add_argument(
+        "--family",
+        default=DEFAULT_TAG_FAMILY,
+        help=(
+            "AprilTag family to detect candidates with "
+            f"(default: {DEFAULT_TAG_FAMILY})"
+        ),
+    )
+    p.add_argument("--host", default="127.0.0.1", help="Review server bind address")
+    p.add_argument("--port", type=int, default=8000, help="Review server port")
+    p.add_argument(
+        "--open",
+        type=_str_to_bool,
+        default=True,
+        help="Open the review UI in a browser on start (default: True)",
+    )
+    p.add_argument(
+        "--precompute-only",
+        type=_str_to_bool,
+        default=False,
+        help=(
+            "Build the frame cache and exit without starting the review "
+            "server — useful on a headless box (default: False)"
+        ),
+    )
     p.set_defaults(func=_run_build_yolo_dataset)
 
 
@@ -3430,7 +3678,7 @@ def _add_train_parser(subparsers: argparse._SubParsersAction) -> None:
         help=(
             "Preset and model training tools (build-testset, "
             "subsample-testset, optimize-preset, compare-presets, "
-            "build-yolo-dataset)"
+            "build-yolo-dataset, build-crop-dataset)"
         ),
     )
     train_sub = train_p.add_subparsers(dest="train_command")
@@ -3439,6 +3687,7 @@ def _add_train_parser(subparsers: argparse._SubParsersAction) -> None:
     _add_optimize_preset_parser(train_sub)
     _add_compare_presets_parser(train_sub)
     _add_build_yolo_dataset_parser(train_sub)
+    _add_build_crop_dataset_parser(train_sub)
     train_p.set_defaults(func=_run_train)
 
 
@@ -3448,7 +3697,8 @@ def _run_train(args: argparse.Namespace) -> None:
 
         print(
             "yoto train — available sub-commands: build-testset, "
-            "subsample-testset, optimize-preset, compare-presets"
+            "subsample-testset, optimize-preset, compare-presets, "
+            "build-yolo-dataset, build-crop-dataset"
         )
         print("Run 'yoto train <sub-command> --help' for details.")
         _sys.exit(1)

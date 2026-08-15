@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """Build an AprilTag optimisation testset from cleaned YOTO pickles.
 
 Composites and crops are produced with the same layout logic as the
@@ -20,6 +18,8 @@ Output layout (one folder per video, never overwritten unless ``force=True``)::
           ...
 """
 
+from __future__ import annotations
+
 import json
 from pathlib import Path
 from typing import Any
@@ -31,6 +31,7 @@ from tqdm import tqdm
 
 from yoto.constants import DEFAULT_BATCH_SIZE, DEFAULT_CONF_THRESHOLD, DEFAULT_PAD_RATIO
 from yoto.detection import _compute_crop_layout
+from yoto.io import find_pickle, strip_pickle_ext
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -145,7 +146,7 @@ def _gt_ids_in_crop(
     y2: int,
     id_list: list[Any],
 ) -> list[tuple[int, float, float, int]]:
-    """Return (tag_id, cx, cy, ass_type) for every tag whose centre falls in the crop."""
+    """Return (tag_id, cx, cy, ass_type) for every tag centred in the crop."""
     row = frame_data.loc[frame_idx]
     out = []
     for tag_id in id_list:
@@ -261,12 +262,15 @@ def _build_testset_yolo(
         return None
 
     # Recover the tag family from the sibling raw detect pickle if present
-    # (<stem>.pkl next to <stem>_yolo.pkl); optimize --tag-family overrides it.
+    # (<stem> next to <stem>_yolo); optimize --tag-family overrides it.
     tag_family = "unknown"
-    raw_pkl = yolo_sidecar.parent / yolo_sidecar.name.replace("_yolo.pkl", ".pkl")
-    if raw_pkl.exists():
+    base = strip_pickle_ext(str(yolo_sidecar))
+    if base.endswith("_yolo"):
+        base = base[: -len("_yolo")]
+    raw_pkl = find_pickle(base)
+    if raw_pkl is not None:
         try:
-            raw_df = pd.read_pickle(str(raw_pkl))
+            raw_df = pd.read_pickle(raw_pkl)
             tag_family = raw_df.attrs.get("yoto_tag_family", "unknown")
         except Exception:
             pass

@@ -122,6 +122,25 @@ body {
   cursor: pointer;
 }
 
+#reset-thr-btn {
+  margin-top: 14px;
+  width: 100%;
+}
+#enhance-label {
+  display: block;
+  margin-top: 10px;
+  font-size: 12px;
+  cursor: pointer;
+}
+#drop-opacity-label {
+  display: block;
+  font-size: 12px;
+}
+#drop-opacity {
+  width: 100%;
+  margin-top: 4px;
+}
+
 #toolbar {
   margin-bottom: 8px;
   display: flex;

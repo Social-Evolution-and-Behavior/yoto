@@ -19,6 +19,7 @@ let state = {
   overrides: {},
   img: null,
   scale: 1,
+  dropAlpha: 1, // opacity of the blue "drop" quads (1 = opaque)
 };
 
 async function api(method, url, body) {
@@ -101,6 +102,7 @@ function draw() {
   const s = state.scale;
   for (const q of d.quads) {
     const acc = accepted(q);
+    ctx.globalAlpha = acc ? 1 : state.dropAlpha;
     ctx.strokeStyle = acc ? ACCEPT : REJECT;
     ctx.lineWidth = acc ? 3 : 2;
     ctx.beginPath();
@@ -112,6 +114,7 @@ function draw() {
     ctx.closePath();
     ctx.stroke();
   }
+  ctx.globalAlpha = 1;
 }
 
 document.getElementById("canvas").addEventListener("click", (e) => {
@@ -137,9 +140,13 @@ document.getElementById("canvas").addEventListener("click", (e) => {
   draw();
 });
 
+function enhanceOn() {
+  return document.getElementById("enhance-chk").checked;
+}
+
 async function loadFrame(exp, frame) {
   state.cur = { exp, frame };
-  state.data = await api("GET", `/api/frame/${exp}/${frame}`);
+  state.data = await api("GET", `/api/frame/${exp}/${frame}?enhance=${enhanceOn()}`);
   state.overrides = state.data.overrides || {};
   document.getElementById("frame-title").textContent =
     `${exp} · frame ${frame} · ${state.data.status}`;
@@ -156,7 +163,7 @@ async function saveDecision(status) {
   await api(
     "PUT",
     `/api/frame/${state.cur.exp}/${state.cur.frame}/decision`,
-    { status, overrides: state.overrides },
+    { status, overrides: state.overrides, enhance: enhanceOn() },
   );
   const idx = state.frames.findIndex(
     (f) => f.exp === state.cur.exp && f.frame === state.cur.frame,
@@ -274,6 +281,25 @@ function renderControls() {
   for (const [key, lo, hi] of SINGLES) makeSingle(box, key, lo, hi);
 }
 
+document.getElementById("enhance-chk").onchange = () => {
+  if (state.cur) loadFrame(state.cur.exp, state.cur.frame);
+};
+const dropInput = document.getElementById("drop-opacity");
+const dropRd = document.getElementById("drop-opacity-rd");
+function updateDrop() {
+  const transparency = +dropInput.value; // 0 = opaque, 1 = invisible
+  state.dropAlpha = 1 - transparency;
+  dropRd.textContent = transparency.toFixed(2);
+  draw();
+}
+dropInput.oninput = updateDrop;
+updateDrop();
+document.getElementById("reset-thr-btn").onclick = async () => {
+  state.thr = await api("GET", "/api/thresholds/default");
+  persistThr(state.thr);
+  renderControls();
+  draw();
+};
 document.getElementById("accept-btn").onclick = () => saveDecision("accepted");
 document.getElementById("skip-btn").onclick = () => saveDecision("skipped");
 document.getElementById("accept-all-btn").onclick = async () => {
